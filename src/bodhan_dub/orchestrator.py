@@ -216,6 +216,7 @@ class PipelineOrchestrator:
             bodhan_client=self.bodhan_client,
             llm_client=self.llm_client,
             logger=self.logger,
+            registry=self.registry,
         )
 
         fit_results = []

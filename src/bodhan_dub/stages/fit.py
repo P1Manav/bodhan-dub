@@ -222,6 +222,12 @@ class SegmentFitController:
         """
         current_en = source_en
         current_tr = initial_translation
+        target_code = lang
+        if code_mixed and self.registry:
+            info = self.registry.get_info(lang)
+            if info and info.code_mixed_target:
+                target_code = info.code_mixed_target
+
         predicted_dur = self.calibrator.predict_duration(current_tr, lang, voice)
         pred_ratio = predicted_dur / max(0.1, slot_duration)
 
@@ -237,7 +243,7 @@ class SegmentFitController:
                 try:
                     re_tr_text, _ = await self.bodhan_client.translate(
                         text=current_en,
-                        target_language_code=lang,
+                        target_language_code=target_code,
                         source_language_code="en",
                         stage="re_translate_pre_fit",
                         lang=lang,
@@ -328,7 +334,7 @@ class SegmentFitController:
                         try:
                             tr_text, _ = await self.bodhan_client.translate(
                                 text=current_en,
-                                target_language_code=lang,
+                                target_language_code=target_code,
                                 source_language_code="en",
                                 stage="re_translate_paraphrase",
                                 lang=lang,
@@ -353,7 +359,7 @@ class SegmentFitController:
                         try:
                             tr_text, _ = await self.bodhan_client.translate(
                                 text=current_en,
-                                target_language_code=lang,
+                                target_language_code=target_code,
                                 source_language_code="en",
                                 stage="re_translate_condense",
                                 lang=lang,
