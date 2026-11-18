@@ -1,0 +1,124 @@
+"""
+Resilience layer: retry with exponential backoff & jitter, Retry-After header parsing,
+per-service concurrency semaphores, and circuit breakers.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import random
+import time
+from typing import Any, Callable, Coroutine, Optional
+
+import httpx
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
+
+
+class CircuitBreakerOpen(Exception):
+    """Raised when the circuit breaker is tripped due to consecutive 5xx errors."""
+
+    pass
+
+
+class CircuitBreaker:
+    """Tracks consecutive 5xx server errors per service/language and trips when threshold exceeded."""
+
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.consecutive_failures: int = 0
+        self.last_failure_time: float = 0.0
+        self.state: str = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        self.state = "CLOSED"
+
+    def record_failure(self, status_code: int) -> None:
+        if status_code >= 500:
+            self.consecutive_failures += 1
+            self.last_failure_time = time.time()
+            if self.consecutive_failures >= self.failure_threshold:
+                self.state = "OPEN"
+
+    def check_state(self) -> None:
+        if self.state == "OPEN":
+            if time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = "HALF_OPEN"
+            else:
+                raise CircuitBreakerOpen(
+                    f"Circuit breaker is OPEN after {self.consecutive_failures} consecutive 5xx errors. "
+                    "Failing fast to isolate service degradation."
+                )
+
+
+def should_retry_exception(exc: BaseException) -> bool:
+    """Retry on network timeouts, connection errors, and 429/5xx status codes."""
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code == 429 or code >= 500:
+            return True
+    return False
+
+
+async def execute_with_resilience(
+    coro_fn: Callable[[], Coroutine[Any, Any, httpx.Response]],
+    semaphore: asyncio.Semaphore,
+    circuit_breaker: Optional[CircuitBreaker] = None,
+    max_attempts: int = 4,
+    min_wait: float = 1.0,
+    max_wait: float = 10.0,
+) -> httpx.Response:
+    """
+    Executes an async HTTP request within a concurrency semaphore, guarded by
+    circuit breaker and retried with backoff and Retry-After awareness.
+    """
+    if circuit_breaker:
+        circuit_breaker.check_state()
+
+    async with semaphore:
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(max_attempts),
+            wait=wait_exponential_jitter(initial=min_wait, max=max_wait, jitter=1.0),
+            retry=retry_if_exception(should_retry_exception),
+            reraise=True,
+        ):
+            with attempt:
+                try:
+                    resp = await coro_fn()
+                    # Check for 429 / 5xx to trigger retry
+                    if resp.status_code == 429:
+                        retry_after_str = resp.headers.get("Retry-After")
+                        wait_sec = (
+                            float(retry_after_str)
+                            if retry_after_str
+                            else (1.5**attempt.retry_state.attempt_number)
+                        )
+                        # Add slight jitter
+                        wait_sec += random.uniform(0.1, 0.5)
+                        await asyncio.sleep(wait_sec)
+                        resp.raise_for_status()
+
+                    elif resp.status_code >= 500:
+                        if circuit_breaker:
+                            circuit_breaker.record_failure(resp.status_code)
+                        resp.raise_for_status()
+
+                    # Success (2xx or 4xx other than 429)
+                    if circuit_breaker and resp.status_code < 400:
+                        circuit_breaker.record_success()
+                    return resp
+
+                except httpx.HTTPStatusError as e:
+                    if circuit_breaker and e.response.status_code >= 500:
+                        circuit_breaker.record_failure(e.response.status_code)
+                    raise
+
+        raise RuntimeError("Retry loop exited without response or exception")

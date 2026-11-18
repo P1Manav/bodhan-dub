@@ -1,0 +1,32 @@
+flowchart TD
+  A["Segment: text, slot duration, slack before and after"] --> B["Predict TTS duration<br/>chars divided by calibrated chars per second"]
+  B --> C{"Predicted ratio above 1.3?"}
+  C -->|yes| D["LLM condenses English with char budget"]
+  D --> E{"Numbers, names, glossary terms preserved<br/>and output is English only?"}
+  E -->|no| F["Discard condensed text, keep original"]
+  E -->|yes| G["Re-translate with Indic-Translate"]
+  C -->|no| H
+  F --> H["Synthesize with Indic-Speak<br/>split at punctuation if text exceeds safe length"]
+  G --> H
+  H --> I["Measure duration, silence, clipping,<br/>trim edge silence"]
+  I --> J["Back-transcribe with Indic-Transcribe"]
+  J --> K["Compute CER, repeated n-grams, tail omission,<br/>duration vs prediction"]
+  K --> L{"QA pass?<br/>CER under threshold, no repeat, no omission"}
+  L -->|no| M{"Attempts left? max 3"}
+  M -->|yes| N["Retry planner: same text, split text,<br/>paraphrase source, condense"]
+  N --> H
+  M -->|no| O["Keep best candidate by CER"]
+  O --> O2{"Best candidate usable?"}
+  O2 -->|yes| P2["Flag degraded"]
+  O2 -->|no| P3["Skip segment, keep original audio, log reason"]
+  L -->|yes| P{"Fit ratio against slot plus slack"}
+  P2 --> P
+  P -->|"at most 1.0"| Q["Keep natural speed, pad with silence"]
+  P -->|"1.0 to 1.2"| R["Time stretch with atempo or rubberband"]
+  P -->|"above 1.2"| S{"Condense attempts left? max 2"}
+  S -->|yes| D
+  S -->|no| T["Borrow slack, stretch to 1.2 max, flag overrun"]
+  Q --> Z["Placed on timeline"]
+  R --> Z
+  T --> Z
+  P3 --> Z2["Original audio kept for this slot"]

@@ -1,0 +1,40 @@
+flowchart TD
+  A(["Start: CLI args"]) --> B{"Preflight OK?<br/>file, streams, duration 1 to 15 min,<br/>ffmpeg, keys, langs valid"}
+  B -->|no| X1(["Exit 2: clear error, no work done"])
+  B -->|yes| C["Cost estimate vs max-cost-inr"]
+  C --> C2{"Estimate within budget?"}
+  C2 -->|no| X2(["Exit 2: show estimate, suggest fewer langs"])
+  C2 -->|yes| D["Ingest: extract 16k mono wav,<br/>keep original audio for mixing"]
+  D --> E["VAD: speech regions and pauses"]
+  E --> E2{"Any speech found?"}
+  E2 -->|no| E3["Passthrough: copy video, status ok_no_speech,<br/>empty transcript, report"]
+  E2 -->|yes| F["Plan chunks: max 28s,<br/>cut at pause nearest target"]
+  F --> G["ASR each chunk in parallel with Indic-Transcribe"]
+  G --> G2{"Chunk failed or empty<br/>while VAD says speech?"}
+  G2 -->|yes| G3["Retry, then split chunk in half and retry, max 2"]
+  G3 --> G
+  G2 -->|no| H["Merge chunks, dedupe overlap,<br/>hallucination filter vs VAD"]
+  H --> I["Segmenter: sentences, TTS-safe length,<br/>slot and slack per segment"]
+  I --> I2{"LLM refinement valid JSON<br/>and English text unchanged?"}
+  I2 -->|no| I3["Use deterministic segmentation"]
+  I2 -->|yes| J
+  I3 --> J["Glossary: user file plus LLM extraction,<br/>validated against transcript"]
+  J --> K["Write transcript.en.json"]
+  K --> L["Fork per language, isolated tasks"]
+  L --> M["Translate segments with protected spans"]
+  M --> M2{"Checks pass?<br/>numbers, terms, script, length ratio, placeholders"}
+  M2 -->|no| M3["Retry, then LLM paraphrases English source,<br/>re-translate, max 3"]
+  M3 --> M
+  M2 -->|yes| N["Back-translate and LLM judge in English"]
+  N --> O["Per-segment TTS fit and QA loop, see diagram 3"]
+  O --> P["Timeline scheduler: offsets within 300 ms, no overlaps"]
+  P --> Q["Mix: mute speech regions, place segments,<br/>normalize to -16 LUFS, mux"]
+  Q --> R{"Output verification<br/>duration within 100 ms, loudness, streams"}
+  R -->|fail| R2["Repair: re-pad or trim, re-mux, max 2"]
+  R2 --> R
+  R -->|pass| S["Subtitles SRT and VTT"]
+  S --> T["segments.lang.json and language status"]
+  T --> U["Join languages, write report.json"]
+  U --> V{"Any language failed?"}
+  V -->|yes| X3(["Exit 1: partial outputs kept"])
+  V -->|no| X4(["Exit 0"])
