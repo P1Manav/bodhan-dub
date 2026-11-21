@@ -18,24 +18,32 @@ from bodhan_dub.gateway.bodhan import BodhanClient
 from bodhan_dub.logging import PipelineLogger
 from bodhan_dub.media.audio_proc import (
     crossfade_concat,
-    resample_24k_to_48k,
+    resample_to_48k,
     trim_edge_silence,
 )
+
+# Documented CPS values from API_FACTS.md live measurements
+API_FACTS_CPS: Dict[Tuple[str, str], float] = {
+    ("hi", "Kavya"): 11.37,
+    ("hi", "Amit"): 13.50,
+    ("bn", "Ishita"): 11.20,
+    ("bn", "Sourav"): 13.80,
+}
 
 
 class CPSCalibrator:
     """Tracks running median and EWMA characters-per-second per (lang, voice)."""
 
     def __init__(self, default_cps: float = 12.0):
-        # B4: Initial calibration seeds emptied per spec; all start at single calibrated default
         self.history: Dict[Tuple[str, str], List[float]] = {}
         self.ewma: Dict[Tuple[str, str], float] = {}
         self.default_cps = default_cps
+        self.seeded_cps: Dict[Tuple[str, str], float] = API_FACTS_CPS.copy()
         # C3: asyncio.Lock for atomic updates across concurrent synthesis tasks
         self.lock = asyncio.Lock()
 
     def is_warmed_up(self, lang: str, voice: str, min_samples: int = 3) -> bool:
-        """B7: True when at least min_samples (default 3) real measurements exist for (lang, voice)."""
+        """True when at least min_samples (default 3) real measurements exist for (lang, voice)."""
         key = (lang, voice)
         return len(self.history.get(key, [])) >= min_samples
 
@@ -44,12 +52,20 @@ class CPSCalibrator:
         key = (lang, voice)
         if key in self.history and self.history[key]:
             return float(median(self.history[key]))
+        if key in self.seeded_cps:
+            return float(self.seeded_cps[key])
         # Fallback to any measurement for this voice
         voice_matches = [
             v for (_lang, v_name), hist in self.history.items() if v_name == voice for v in hist
         ]
         if voice_matches:
             return float(median(voice_matches))
+        # Fallback to seeded cps for this voice in another language
+        voice_seeded = [
+            cps for (_lang, v_name), cps in self.seeded_cps.items() if v_name == voice
+        ]
+        if voice_seeded:
+            return float(median(voice_seeded))
         return self.default_cps
 
     def record_measurement(self, lang: str, voice: str, char_count: int, duration_s: float) -> None:
@@ -183,7 +199,7 @@ class TTSSynthesizer:
         # Split into <=max_chars character chunks at punctuation
         pieces = split_text_at_punctuation(text, max_chars=max_chars)
 
-        audio_pieces: List[np.ndarray] = []
+        audio_pieces: List[Tuple[np.ndarray, int]] = []
         for idx, piece in enumerate(pieces):
             piece_id = f"{segment_id}_p{idx}" if len(pieces) > 1 else segment_id
             speak_kwargs = {"stage": "tts", "lang": lang, "segment_id": piece_id}
@@ -197,22 +213,26 @@ class TTSSynthesizer:
                 **speak_kwargs,
             )
 
-            # Read 24kHz audio from bytes
+            # Read audio and real sample rate from bytes
             with io.BytesIO(raw_wav_bytes) as buf:
-                samples_24k, sr = sf.read(buf, dtype="float32")
-                if len(samples_24k.shape) > 1:
-                    samples_24k = samples_24k[:, 0]
+                samples, piece_sr = sf.read(buf, dtype="float32")
+                if len(samples.shape) > 1:
+                    samples = samples[:, 0]
 
-            # Trim leading/trailing edge silence
-            trimmed = trim_edge_silence(samples_24k)
+            # Trim leading/trailing edge silence (10ms at native rate)
+            trimmed = trim_edge_silence(samples, min_keep_samples=max(1, int(0.010 * piece_sr)))
             if len(trimmed) > 0:
-                audio_pieces.append(trimmed)
+                audio_pieces.append((trimmed, piece_sr))
 
-        # Stitch pieces with 10ms smooth crossfades
-        stitched_24k = crossfade_concat(audio_pieces, crossfade_ms=10, sample_rate=24000)
+        if not audio_pieces:
+            return np.zeros(0, dtype=np.float32), 0.0, predicted_dur
 
-        # Resample to 48kHz float32 for video pipeline standard
-        audio_48k = resample_24k_to_48k(stitched_24k)
+        first_sr = audio_pieces[0][1]
+        # Stitch pieces with 10ms smooth crossfades at native rate
+        stitched = crossfade_concat([p[0] for p in audio_pieces], crossfade_ms=10, sample_rate=first_sr)
+
+        # Resample dynamically from real sample rate to 48kHz float32
+        audio_48k = resample_to_48k(stitched, orig_sr=first_sr)
         actual_dur = len(audio_48k) / 48000.0
 
         # Update calibration history with lock

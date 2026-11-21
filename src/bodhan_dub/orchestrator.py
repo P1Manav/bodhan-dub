@@ -6,6 +6,7 @@ pipelines in parallel with full error isolation and resume checkpointing.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ import httpx
 import numpy as np
 
 from bodhan_dub.config import Settings
-from bodhan_dub.gateway.bodhan import BodhanClient
+from bodhan_dub.gateway.bodhan import BodhanClient, UnknownVoiceOrLanguageError
 from bodhan_dub.gateway.cache import DiskCache
 from bodhan_dub.gateway.cost import BudgetExceededError, BudgetGuard, CostLedger
 from bodhan_dub.gateway.llm import LLMClient
@@ -36,8 +37,8 @@ from bodhan_dub.media.mux import (
     mux_and_verify,
     probe_media_streams,
 )
-from bodhan_dub.media.vad import SileroVADDetector, VADResult
-from bodhan_dub.stages.asr import ASRStage
+from bodhan_dub.media.vad import Pause, SileroVADDetector, SpeechRegion, VADResult
+from bodhan_dub.stages.asr import ASRStage, TranscribedSegment
 from bodhan_dub.stages.fit import SegmentFitController, SegmentFitResult
 from bodhan_dub.stages.glossary import Glossary, GlossaryBuilder
 from bodhan_dub.stages.qa import QAMetrics
@@ -92,6 +93,15 @@ class PipelineOrchestrator:
         self.speaker_voices = speaker_voices
         self.custom_voices = custom_voices or {}
         self.separate_music_vocal_path: Optional[Path] = None
+        self.completed_summaries: Dict[str, LanguageSummary] = {}
+
+        # E2: Register all configured secrets for log/console/report redaction
+        from bodhan_dub.logging import register_secret
+        register_secret(settings.bodhan_transcribe_key)
+        register_secret(settings.bodhan_translate_key)
+        register_secret(settings.bodhan_speak_key)
+        register_secret(settings.bodhan_ocr_key)
+        register_secret(settings.llm_api_key)
 
         self.cache = DiskCache(cache_dir=settings.cache_dir, enabled=not no_cache)
         self.ledger = CostLedger(
@@ -130,59 +140,103 @@ class PipelineOrchestrator:
         """
         Executes shared stages: Ingest -> VAD -> Chunking -> ASR -> Segmentation -> Glossary.
         Returns (vad_result, english_segments, audio_original_path, glossary).
+        Honors manifest.is_stage_completed on --resume via work_dir checkpoints.
         """
+        try:
+            st = video_path.stat()
+            input_hash = hashlib.sha256(f"{st.st_size}_{st.st_mtime}_{video_path.name}".encode("utf-8")).hexdigest()[:16]
+        except Exception:
+            input_hash = "unknown"
+
         # 1. Ingest: Audio extraction
-        self.manifest.mark_stage_start("ingest")
-        self.logger.info("Extracting 16kHz audio for ASR and 48kHz audio for background mix...", stage="ingest")
         audio_16k = self.work_dir / "audio_16k.wav"
         audio_orig = self.work_dir / "audio_original.wav"
 
-        extract_audio_for_asr(video_path, audio_16k)
-        probe_info = probe_media_streams(video_path)
-        v_dur = get_stream_duration(probe_info, "video")
-        extract_audio_original(video_path, audio_orig, target_duration=v_dur)
+        if (
+            self.resume
+            and self.manifest.is_stage_completed("ingest")
+            and audio_16k.exists()
+            and audio_orig.exists()
+        ):
+            self.logger.info(f"Resuming ingest from existing audio in {self.work_dir}", stage="ingest")
+        else:
+            self.manifest.mark_stage_start("ingest")
+            self.logger.info("Extracting 16kHz audio for ASR and 48kHz audio for background mix...", stage="ingest")
+            extract_audio_for_asr(video_path, audio_16k)
+            probe_info = probe_media_streams(video_path)
+            v_dur = get_stream_duration(probe_info, "video")
+            extract_audio_original(video_path, audio_orig, target_duration=v_dur)
 
-        # C4: Background music separation if requested
-        self.separate_music_vocal_path = None
-        if self.separate_music:
-            import shutil
-            demucs_bin = shutil.which("demucs")
-            spleeter_bin = shutil.which("spleeter")
-            if demucs_bin or spleeter_bin:
-                self.logger.info("Running background music separation (Demucs/Spleeter)...", stage="ingest")
-                tool = demucs_bin or spleeter_bin
-                try:
-                    cmd = [tool, "-n", "htdemucs", "--two-stems", "vocals", "-o", str(self.work_dir), str(audio_orig)]
-                    await asyncio.to_thread(subprocess.run, cmd, capture_output=True, check=True)
-                    vocal_candidate = self.work_dir / "htdemucs" / audio_orig.stem / "vocals.wav"
-                    if vocal_candidate.exists():
-                        self.separate_music_vocal_path = vocal_candidate
-                except Exception as e:
+            # C4: Background music separation if requested
+            self.separate_music_vocal_path = None
+            if self.separate_music:
+                import shutil
+                demucs_bin = shutil.which("demucs")
+                spleeter_bin = shutil.which("spleeter")
+                if demucs_bin or spleeter_bin:
+                    self.logger.info("Running background music separation (Demucs/Spleeter)...", stage="ingest")
+                    tool = demucs_bin or spleeter_bin
+                    try:
+                        cmd = [tool, "-n", "htdemucs", "--two-stems", "vocals", "-o", str(self.work_dir), str(audio_orig)]
+                        await asyncio.to_thread(subprocess.run, cmd, capture_output=True, check=True)
+                        vocal_candidate = self.work_dir / "htdemucs" / audio_orig.stem / "vocals.wav"
+                        if vocal_candidate.exists():
+                            self.separate_music_vocal_path = vocal_candidate
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Music separation execution failed: {e}. Falling back cleanly to VAD ducking path.",
+                            stage="ingest",
+                        )
+                        self.separate_music_vocal_path = None
+                else:
                     self.logger.warning(
-                        f"Music separation execution failed: {e}. Falling back cleanly to VAD ducking path.",
+                        "Music separation requested (--separate-music), but neither demucs nor spleeter is installed or in PATH. "
+                        "Falling back cleanly to VAD ducking path.",
                         stage="ingest",
                     )
-                    self.separate_music_vocal_path = None
-            else:
-                self.logger.warning(
-                    "Music separation requested (--separate-music), but neither demucs nor spleeter is installed or in PATH. "
-                    "Falling back cleanly to VAD ducking path.",
-                    stage="ingest",
-                )
-
-        self.manifest.mark_stage_completed("ingest")
+            self.manifest.mark_stage_completed("ingest")
 
         # 2. VAD: Speech boundary detection
-        self.manifest.mark_stage_start("vad")
-        self.logger.info("Running Voice Activity Detection (Silero/ffmpeg)...", stage="vad")
-        vad_detector = SileroVADDetector()
-        vad_result = await vad_detector.async_process(audio_16k)
-        self.logger.info(
-            f"VAD complete ({vad_result.engine_used}): {len(vad_result.speech_regions)} speech regions, "
-            f"total speech {vad_result.total_speech_duration:.1f}s / {vad_result.total_duration:.1f}s",
-            stage="vad",
-        )
-        self.manifest.mark_stage_completed("vad")
+        vad_cache_file = self.work_dir / "vad_result.json"
+        vad_result = None
+        if self.resume and self.manifest.is_stage_completed("vad") and vad_cache_file.exists():
+            try:
+                saved_vad = json.loads(vad_cache_file.read_text(encoding="utf-8"))
+                if saved_vad.get("input_hash") == input_hash:
+                    vad_result = VADResult(
+                        total_duration=saved_vad["data"]["total_duration"],
+                        speech_regions=[SpeechRegion(start=r["start"], end=r["end"]) for r in saved_vad["data"]["speech_regions"]],
+                        pauses=[Pause(start=p["start"], end=p["end"]) for p in saved_vad["data"]["pauses"]],
+                        engine_used=saved_vad["data"].get("engine_used", "checkpoint"),
+                    )
+                    self.logger.info(f"Resumed VAD from checkpoint: {len(vad_result.speech_regions)} speech regions", stage="vad")
+            except Exception:
+                vad_result = None
+
+        if vad_result is None:
+            self.manifest.mark_stage_start("vad")
+            self.logger.info("Running Voice Activity Detection (Silero/ffmpeg)...", stage="vad")
+            vad_detector = SileroVADDetector()
+            vad_result = await vad_detector.async_process(audio_16k)
+            self.logger.info(
+                f"VAD complete ({vad_result.engine_used}): {len(vad_result.speech_regions)} speech regions, "
+                f"total speech {vad_result.total_speech_duration:.1f}s / {vad_result.total_duration:.1f}s",
+                stage="vad",
+            )
+            try:
+                vad_data = {
+                    "input_hash": input_hash,
+                    "data": {
+                        "total_duration": vad_result.total_duration,
+                        "engine_used": vad_result.engine_used,
+                        "speech_regions": [{"start": r.start, "end": r.end} for r in vad_result.speech_regions],
+                        "pauses": [{"start": p.start, "end": p.end} for p in vad_result.pauses],
+                    },
+                }
+                vad_cache_file.write_text(json.dumps(vad_data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            self.manifest.mark_stage_completed("vad")
 
         # Handle silent / music-only video
         if not vad_result.has_speech:
@@ -198,36 +252,76 @@ class PipelineOrchestrator:
         self.manifest.mark_stage_completed("chunk_planner")
 
         # 4. ASR Stage
-        self.manifest.mark_stage_start("asr")
-        self.logger.info(f"Transcribing {len(chunks)} chunks with Indic-Transcribe...", stage="asr")
-        asr_stage = ASRStage(self.bodhan_client, self.logger)
-        raw_segments = await asr_stage.run(audio_16k, chunks, vad_result)
-        self.logger.info(f"ASR complete: produced {len(raw_segments)} raw segments", stage="asr")
-        self.manifest.mark_stage_completed("asr")
+        asr_cache_file = self.work_dir / "asr_segments.json"
+        raw_segments = None
+        if self.resume and self.manifest.is_stage_completed("asr") and asr_cache_file.exists():
+            try:
+                saved_asr = json.loads(asr_cache_file.read_text(encoding="utf-8"))
+                if saved_asr.get("input_hash") == input_hash:
+                    raw_segments = [TranscribedSegment(**s) for s in saved_asr["data"]]
+                    self.logger.info(f"Resumed ASR from checkpoint: {len(raw_segments)} segments", stage="asr")
+            except Exception:
+                raw_segments = None
+
+        if raw_segments is None:
+            self.manifest.mark_stage_start("asr")
+            self.logger.info(f"Transcribing {len(chunks)} chunks with Indic-Transcribe...", stage="asr")
+            asr_stage = ASRStage(self.bodhan_client, self.logger)
+            raw_segments = await asr_stage.run(audio_16k, chunks, vad_result)
+            self.logger.info(f"ASR complete: produced {len(raw_segments)} raw segments", stage="asr")
+            try:
+                asr_data = {
+                    "input_hash": input_hash,
+                    "data": [s.model_dump() for s in raw_segments],
+                }
+                asr_cache_file.write_text(json.dumps(asr_data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            self.manifest.mark_stage_completed("asr")
 
         # 5. Segmenter with Slot & Slack
-        self.manifest.mark_stage_start("segmenter")
-        self.logger.info("Running sentence segmentation and computing slot/slack...", stage="segmenter")
-        segmenter = Segmenter(self.llm_client, self.logger)
-        english_segments = await segmenter.run(raw_segments, total_audio_duration=vad_result.total_duration)
-        self.logger.info(f"Segmentation complete: finalized {len(english_segments)} sentence slots", stage="segmenter")
-
-        # C6: Speaker-voices auto mode pitch extraction
-        if self.speaker_voices == "auto" and english_segments:
+        seg_cache_file = self.work_dir / "english_segments.json"
+        english_segments = None
+        if self.resume and self.manifest.is_stage_completed("segmenter") and seg_cache_file.exists():
             try:
-                import soundfile as sf
+                saved_seg = json.loads(seg_cache_file.read_text(encoding="utf-8"))
+                if saved_seg.get("input_hash") == input_hash:
+                    english_segments = [SegmentSlot(**s) for s in saved_seg["data"]]
+                    self.logger.info(f"Resumed segmenter from checkpoint: {len(english_segments)} sentence slots", stage="segmenter")
+            except Exception:
+                english_segments = None
 
-                from bodhan_dub.stages.segment import estimate_segment_pitch
-                audio_16k_data, sr_16k = sf.read(str(audio_16k), dtype="float32")
-                for s in english_segments:
-                    start_s = max(0, int(s.start * sr_16k))
-                    end_s = min(len(audio_16k_data), int(s.end * sr_16k))
-                    if end_s > start_s:
-                        s.pitch_hz = estimate_segment_pitch(audio_16k_data[start_s:end_s], sr_16k)
-            except Exception as e:
-                self.logger.warning(f"Pitch estimation failed: {e}", stage="segmenter")
+        if english_segments is None:
+            self.manifest.mark_stage_start("segmenter")
+            self.logger.info("Running sentence segmentation and computing slot/slack...", stage="segmenter")
+            segmenter = Segmenter(self.llm_client, self.logger)
+            english_segments = await segmenter.run(raw_segments, total_audio_duration=vad_result.total_duration)
+            self.logger.info(f"Segmentation complete: finalized {len(english_segments)} sentence slots", stage="segmenter")
 
-        self.manifest.mark_stage_completed("segmenter")
+            # C6: Speaker-voices auto mode pitch extraction
+            if self.speaker_voices == "auto" and english_segments:
+                try:
+                    import soundfile as sf
+
+                    from bodhan_dub.stages.segment import estimate_segment_pitch
+                    audio_16k_data, sr_16k = sf.read(str(audio_16k), dtype="float32")
+                    for s in english_segments:
+                        start_s = max(0, int(s.start * sr_16k))
+                        end_s = min(len(audio_16k_data), int(s.end * sr_16k))
+                        if end_s > start_s:
+                            s.pitch_hz = estimate_segment_pitch(audio_16k_data[start_s:end_s], sr_16k)
+                except Exception as e:
+                    self.logger.warning(f"Pitch estimation failed: {e}", stage="segmenter")
+
+            try:
+                seg_data = {
+                    "input_hash": input_hash,
+                    "data": [s.model_dump() for s in english_segments],
+                }
+                seg_cache_file.write_text(json.dumps(seg_data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            self.manifest.mark_stage_completed("segmenter")
 
         # 6. Write English Outputs
         write_transcript_en_json(english_segments, self.out_dir / "transcript.en.json")
@@ -236,15 +330,43 @@ class PipelineOrchestrator:
         self.logger.info(f"Wrote English transcript and subtitles to {self.out_dir}", stage="segmenter")
 
         # 7. Glossary Builder
-        self.manifest.mark_stage_start("glossary")
-        glossary_builder = GlossaryBuilder(
-            llm_client=self.llm_client,
-            bodhan_client=self.bodhan_client,
-            logger=self.logger,
-            user_glossary_path=self.glossary_path,
-        )
-        glossary = await glossary_builder.build(english_segments, target_langs)
-        self.manifest.mark_stage_completed("glossary")
+        glossary_cache_file = self.work_dir / "glossary.json"
+        glossary = None
+        if self.resume and self.manifest.is_stage_completed("glossary") and glossary_cache_file.exists():
+            try:
+                saved_gl = json.loads(glossary_cache_file.read_text(encoding="utf-8"))
+                if saved_gl.get("input_hash") == input_hash:
+                    gl_data = saved_gl.get("data")
+                    if gl_data:
+                        glossary = Glossary(
+                            user_terms=gl_data.get("user_terms", {}),
+                            extracted_terms=set(gl_data.get("extracted_terms", [])),
+                        )
+                        glossary.canonical_map = gl_data.get("canonical_map", {})
+                        self.logger.info("Resumed glossary from checkpoint", stage="glossary")
+            except Exception:
+                glossary = None
+
+        if glossary is None:
+            self.manifest.mark_stage_start("glossary")
+            glossary_builder = GlossaryBuilder(
+                llm_client=self.llm_client,
+                bodhan_client=self.bodhan_client,
+                logger=self.logger,
+                user_glossary_path=self.glossary_path,
+            )
+            glossary = await glossary_builder.build(english_segments, target_langs)
+            try:
+                gl_dict = {
+                    "user_terms": glossary.user_terms,
+                    "extracted_terms": list(glossary.extracted_terms),
+                    "canonical_map": glossary.canonical_map,
+                }
+                gl_data = {"input_hash": input_hash, "data": gl_dict}
+                glossary_cache_file.write_text(json.dumps(gl_data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            self.manifest.mark_stage_completed("glossary")
 
         return vad_result, english_segments, audio_orig, glossary
 
@@ -257,11 +379,14 @@ class PipelineOrchestrator:
         """Flushes manifest, partial report, and logs during interrupt or fatal error."""
         try:
             self.manifest.save(self.out_dir / "manifest.json")
+            merged_summaries = dict(self.completed_summaries)
+            if lang_summaries:
+                merged_summaries.update(lang_summaries)
             report = build_pipeline_report(
                 run_id=self.manifest.run_id,
                 input_file=str(video_path),
                 video_duration_s=0.0,
-                lang_summaries=lang_summaries or {},
+                lang_summaries=merged_summaries,
                 cost_ledger=self.ledger,
                 stage_timings=stage_timings or {},
             )
@@ -309,7 +434,7 @@ class PipelineOrchestrator:
                 target_lang=lang,
                 glossary=glossary or Glossary(),
             )
-        except (BudgetExceededError, CircuitBreakerOpen) as e:
+        except (BudgetExceededError, CircuitBreakerOpen, UnknownVoiceOrLanguageError) as e:
             self.logger.error(f"Translation stopped for '{lang}': {e}", stage="translate", lang=lang)
             lang_errors.append(str(e))
             translations = [
@@ -331,6 +456,7 @@ class PipelineOrchestrator:
             llm_client=self.llm_client,
             logger=self.logger,
             registry=self.registry,
+            settings=self.settings,
         )
 
         lang_work_dir = self.work_dir / lang
@@ -381,6 +507,7 @@ class PipelineOrchestrator:
             ).hexdigest()
 
             cached_wav = lang_work_dir / f"{seg.segment_id}.wav"
+            cached_raw_wav = lang_work_dir / f"{seg.segment_id}.raw.wav"
             cached_meta = lang_work_dir / f"{seg.segment_id}.meta.json"
 
             if (
@@ -391,6 +518,11 @@ class PipelineOrchestrator:
                 try:
                     c_audio, c_sr = sf.read(str(cached_wav), dtype="float32")
                     c_dur = len(c_audio) / float(c_sr)
+                    if cached_raw_wav.exists():
+                        raw_c_audio, _ = sf.read(str(cached_raw_wav), dtype="float32")
+                    else:
+                        raw_c_audio = c_audio.copy()
+
                     self.logger.info(
                         f"Resuming segment {seg.segment_id} from checkpoint ({c_dur:.2f}s)",
                         stage="fit",
@@ -399,24 +531,24 @@ class PipelineOrchestrator:
                     )
                     if cached_meta.exists():
                         saved_meta = json.loads(cached_meta.read_text(encoding="utf-8"))
-                        res = SegmentFitResult(**saved_meta["res"], raw_audio=c_audio.copy())
+                        res = SegmentFitResult(**saved_meta["res"], raw_audio=raw_c_audio)
                     else:
                         res = SegmentFitResult(
                             segment_id=seg.segment_id,
                             source_en=seg.text,
                             final_en=seg.text,
                             final_translation=tr_info.target_text,
-                            raw_duration=c_dur,
+                            raw_duration=len(raw_c_audio) / 48000.0,
                             final_duration=c_dur,
                             slot_duration=seg.slot_duration,
                             start_shift=0.0,
-                            speed_factor=1.0,
+                            speed_factor=round(c_dur / max(0.01, len(raw_c_audio) / 48000.0), 3),
                             qa_metrics=QAMetrics(cer=0.0, passed=True, failure_reasons=[]),
                             qa_status="passed",
                             fit_status="fit_exact",
                             attempts=1,
                             reasons=[],
-                            raw_audio=c_audio.copy(),
+                            raw_audio=raw_c_audio,
                         )
                     return idx, res, c_audio
                 except Exception:
@@ -440,6 +572,8 @@ class PipelineOrchestrator:
             if audio_48k is not None:
                 try:
                     sf.write(str(cached_wav), audio_48k, 48000)
+                    if res.raw_audio is not None and len(res.raw_audio) > 0:
+                        sf.write(str(cached_raw_wav), res.raw_audio, 48000)
                     cached_meta.write_text(
                         json.dumps({
                             "content_hash": seg_hash,
@@ -463,9 +597,22 @@ class PipelineOrchestrator:
                 fit_raw_results[i] = await _fit_single_segment(i, seg, tr_info, v)
             except Exception as e:
                 fit_raw_results[i] = e
+                # C4: Fast-fail remaining segments on fatal voice/language error or breaker open
+                if isinstance(e, (UnknownVoiceOrLanguageError, CircuitBreakerOpen)):
+                    self.logger.error(
+                        f"Fast-failing remaining segments for language '{lang}' due to: {e}",
+                        stage="fit",
+                        lang=lang,
+                    )
+                    break
 
-        # Remaining segments synthesize in parallel with warmed-up calibration
-        if len(english_segments) > warmup_n:
+        fatal_error = next(
+            (e for e in fit_raw_results[:warmup_n] if isinstance(e, (UnknownVoiceOrLanguageError, CircuitBreakerOpen))),
+            None,
+        )
+
+        # Remaining segments synthesize in parallel with warmed-up calibration (unless fatal error tripped)
+        if not fatal_error and len(english_segments) > warmup_n:
             rem_tasks = [
                 _fit_single_segment(i, english_segments[i], translations[i], segment_voices[i])
                 for i in range(warmup_n, len(english_segments))
@@ -473,6 +620,10 @@ class PipelineOrchestrator:
             rem_results = await asyncio.gather(*rem_tasks, return_exceptions=True)
             for idx_offset, res in enumerate(rem_results):
                 fit_raw_results[warmup_n + idx_offset] = res
+        elif fatal_error:
+            for i in range(len(fit_raw_results)):
+                if fit_raw_results[i] is None:
+                    fit_raw_results[i] = fatal_error
 
         fit_results = []
         audio_buffers = []
@@ -569,12 +720,12 @@ class PipelineOrchestrator:
                 "start": sched_seg.placed_start,
                 "end": sched_seg.placed_end,
                 "audio_duration": fit_res.final_duration,
-                "speed_factor": fit_res.speed_factor,
-                "start_shift": fit_res.start_shift,
-                "qa_status": fit_res.qa_status,
-                "fit_status": fit_res.fit_status,
+                "speed_factor": sched_seg.speed_factor,
+                "start_shift": sched_seg.start_shift_s,
+                "qa_status": sched_seg.qa_status,
+                "fit_status": sched_seg.fit_status,
                 "cer": fit_res.qa_metrics.cer,
-                "qa_reasons": fit_res.reasons,
+                "qa_reasons": sched_seg.reasons if sched_seg.reasons else fit_res.reasons,
             })
 
         write_target_segments_json(segments_json_data, lang_out_dir / f"segments.{lang}.json")
@@ -608,7 +759,12 @@ class PipelineOrchestrator:
 
         # Compute summary statistics
         stretches = [s.speed_factor for s in sched_res.segments if not s.is_skipped]
-        cers = [s.qa_metrics.cer for s in fit_results if not s.qa_metrics.is_empty]
+        # D3: Exclude unverified / None CERs from CER stats
+        cers = [
+            s.qa_metrics.cer for s in fit_results
+            if not s.qa_metrics.is_empty and getattr(s.qa_metrics, "verified", True) and s.qa_metrics.cer is not None
+        ]
+        qa_unverified_count = sum(1 for s in fit_results if not getattr(s.qa_metrics, "verified", True))
 
         flagged_count = sum(
             1 for idx, r in enumerate(fit_results)
@@ -634,6 +790,10 @@ class PipelineOrchestrator:
         else:
             status = "ok"
 
+        stem_lufs_measured = getattr(integrated_lufs, "stem_lufs", None)
+        if stem_lufs_measured is None:
+            stem_lufs_measured = round(measure_loudness(speech_stem_48k, 48000), 2) if np.max(np.abs(speech_stem_48k)) > 1e-4 else -70.0
+
         summary = LanguageSummary(
             status=status,
             total_segments=sched_res.total_segments,
@@ -642,6 +802,7 @@ class PipelineOrchestrator:
             skipped_segments=sched_res.skipped_segments,
             flagged_segments=flagged_count,
             overrun_segments=overrun_count,
+            qa_unverified=qa_unverified_count,
             stretch_stats={
                 "min": float(np.min(stretches)) if stretches else 1.0,
                 "max": float(np.max(stretches)) if stretches else 1.0,
@@ -655,8 +816,8 @@ class PipelineOrchestrator:
                 "mean": float(np.mean(cers)) if cers else 0.0,
                 "p95": float(np.percentile(cers, 95)) if cers else 0.0,
             },
-            integrated_lufs=round(integrated_lufs, 2),
-            stem_lufs=round(measure_loudness(speech_stem_48k, 48000), 2) if np.max(np.abs(speech_stem_48k)) > 1e-4 else -70.0,
+            integrated_lufs=round(float(integrated_lufs), 2),
+            stem_lufs=round(float(stem_lufs_measured), 2),
             true_peak_dbtp=mux_res.measured_tp_dbtp,
             duration_delta_ms=round(mux_res.duration_delta_ms, 1),
             retries_count=retries_count,
@@ -699,8 +860,8 @@ class PipelineOrchestrator:
         try:
             vad_res, english_segments, audio_orig_path, glossary = await self.run_shared_stages(video_path, target_langs)
             stage_timings["shared_stages"] = time.time() - t0
-        except (BudgetExceededError, CircuitBreakerOpen) as e:
-            self.logger.error(f"Shared stages stopped due to fatal condition: {e}", stage="pipeline")
+        except Exception as e:
+            self.logger.error(f"Shared stages stopped due to failure: {e}", stage="pipeline")
             lang_summaries = {}
             for lang in target_langs:
                 lang_dir = self.out_dir / lang
@@ -827,11 +988,12 @@ class PipelineOrchestrator:
         # 2. Per-Language Parallel Fork with Concurrency Semaphore (C3)
         t_lang_start = time.time()
         lang_sem = asyncio.Semaphore(self.concurrency)
+        self.completed_summaries.clear()
 
         async def _run_lang_worker(lang_code: str):
             async with lang_sem:
                 v = (custom_voices.get(lang_code) if custom_voices else None) or self.custom_voices.get(lang_code)
-                return await self.process_language(
+                summary = await self.process_language(
                     lang=lang_code,
                     video_path=video_path,
                     audio_orig_path=audio_orig_path,
@@ -840,17 +1002,68 @@ class PipelineOrchestrator:
                     glossary=glossary,
                     voice=v,
                 )
+                self.completed_summaries[lang_code] = summary
+                return summary
 
         tasks = [asyncio.create_task(_run_lang_worker(lang_code)) for lang_code in target_langs]
 
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-        except (asyncio.CancelledError, KeyboardInterrupt):
+        except (asyncio.CancelledError, KeyboardInterrupt) as exc:
             for t in tasks:
                 if not t.done():
                     t.cancel()
-            self.flush_partial_state(video_path, stage_timings=stage_timings)
-            raise
+            partial_summaries = dict(self.completed_summaries)
+            for lang in target_langs:
+                if lang not in partial_summaries:
+                    partial_summaries[lang] = LanguageSummary(
+                        status="failed",
+                        total_segments=len(english_segments) if english_segments else 0,
+                        placed_segments=0,
+                        degraded_segments=0,
+                        skipped_segments=len(english_segments) if english_segments else 0,
+                        flagged_segments=0,
+                        overrun_segments=0,
+                        integrated_lufs=-70.0,
+                        duration_delta_ms=0.0,
+                        retries_count=0,
+                        errors=["Interrupted by user (SIGINT/Cancelled)"],
+                    )
+            self.flush_partial_state(
+                video_path,
+                lang_summaries=partial_summaries,
+                stage_timings=stage_timings,
+            )
+            raise exc
+
+        # Check if any task completed with CancelledError / KeyboardInterrupt
+        interrupted = [r for r in results if isinstance(r, (asyncio.CancelledError, KeyboardInterrupt))]
+        if interrupted:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            partial_summaries = dict(self.completed_summaries)
+            for lang in target_langs:
+                if lang not in partial_summaries:
+                    partial_summaries[lang] = LanguageSummary(
+                        status="failed",
+                        total_segments=len(english_segments) if english_segments else 0,
+                        placed_segments=0,
+                        degraded_segments=0,
+                        skipped_segments=len(english_segments) if english_segments else 0,
+                        flagged_segments=0,
+                        overrun_segments=0,
+                        integrated_lufs=-70.0,
+                        duration_delta_ms=0.0,
+                        retries_count=0,
+                        errors=["Interrupted by user (SIGINT/Cancelled)"],
+                    )
+            self.flush_partial_state(
+                video_path,
+                lang_summaries=partial_summaries,
+                stage_timings=stage_timings,
+            )
+            raise interrupted[0]
 
         stage_timings["per_language_stages"] = time.time() - t_lang_start
 
@@ -858,7 +1071,7 @@ class PipelineOrchestrator:
         any_failed = False
 
         for lang, res in zip(target_langs, results):
-            if isinstance(res, Exception):
+            if isinstance(res, BaseException):
                 self.logger.error(f"Language pipeline '{lang}' failed with exception: {res}", stage="pipeline", lang=lang)
                 any_failed = True
                 lang_summaries[lang] = LanguageSummary(
@@ -894,8 +1107,13 @@ class PipelineOrchestrator:
         self.manifest.save(self.out_dir / "manifest.json")
         self.logger.save_log(self.out_dir / "run.log.jsonl")
 
-        # Clean work directory if requested
-        if not self.keep_work and self.work_dir.exists():
+        # Clean work directory only on full success ("ok") without keep_work and not resume
+        if (
+            not self.keep_work
+            and not self.resume
+            and report.overall_status == "ok"
+            and self.work_dir.exists()
+        ):
             shutil.rmtree(self.work_dir, ignore_errors=True)
 
         self.logger.info(

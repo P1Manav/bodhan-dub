@@ -88,14 +88,54 @@ def validate_llm_text(text: str, context: str = "LLM input/output") -> str:
 guard_llm_output_english_only = validate_llm_text
 
 
+BODHAN_CANONICAL_HOST = "api.bodhan.ai"
+
+
+def validate_bodhan_host(url_or_host: str, allow_test_hosts: Optional[bool] = None) -> str:
+    """
+    E3: Enforces that the Bodhan API host is strictly 'api.bodhan.ai'.
+    Allows localhost / 127.0.0.1 / testserver only when BODHAN_ALLOW_TEST_HOSTS=1.
+    Rejects custom Bodhan hosts (e.g. 'custom.bodhan.ai', 'other.com').
+    """
+    if allow_test_hosts is None:
+        allow_test_hosts = os.getenv("BODHAN_ALLOW_TEST_HOSTS", "0") in ("1", "true", "True")
+
+    clean = str(url_or_host).strip()
+    parsed = urlparse(clean) if "://" in clean else urlparse(f"https://{clean}")
+    host = (parsed.hostname or clean.split(":")[0]).lower()
+
+    if host == BODHAN_CANONICAL_HOST:
+        return host
+    if allow_test_hosts and host in ("localhost", "127.0.0.1", "testserver"):
+        return host
+
+    raise PolicyViolation(
+        f"Security Policy Violation: Bodhan API host must be strictly '{BODHAN_CANONICAL_HOST}' "
+        f"(got '{host}'). Custom Bodhan hosts are prohibited."
+    )
+
+
 class HostAllowlistGuard:
     """HTTP client event hook enforcing that requests only target allowlisted hosts."""
 
-    def __init__(self, allowed_hosts: List[str], allow_test_hosts: Optional[bool] = None):
-        self.allowed_hosts: Set[str] = set(h.lower() for h in allowed_hosts if h)
-        # B19: HostAllowlistGuard allows localhost/127.0.0.1/testserver only under a test flag
+    def __init__(
+        self,
+        allowed_hosts: List[str],
+        allow_test_hosts: Optional[bool] = None,
+        enforce_strict_bodhan: bool = True,
+    ):
         if allow_test_hosts is None:
             allow_test_hosts = os.getenv("BODHAN_ALLOW_TEST_HOSTS", "0") in ("1", "true", "True")
+
+        self.allowed_hosts: Set[str] = set()
+        for h in allowed_hosts:
+            if not h:
+                continue
+            h_clean = h.lower()
+            if enforce_strict_bodhan and "bodhan.ai" in h_clean:
+                validate_bodhan_host(h_clean, allow_test_hosts=allow_test_hosts)
+            self.allowed_hosts.add(h_clean)
+
         if allow_test_hosts:
             self.allowed_hosts.add("localhost")
             self.allowed_hosts.add("127.0.0.1")

@@ -14,9 +14,10 @@ from bodhan_dub.stages.tts import CPSCalibrator, TTSSynthesizer, split_text_at_p
 
 def test_cps_calibrator_running_median():
     calibrator = CPSCalibrator()
-    # Unmeasured voice starts at default 12.0
+    # Unseeded voice starts at default 12.0; seeded voice starts at documented API_FACTS CPS
+    assert calibrator.get_cps("hi", "UnknownVoice") == 12.0
     initial_cps = calibrator.get_cps("hi", "Kavya")
-    assert initial_cps == 12.0
+    assert initial_cps == 11.37
 
     # Record 3 measurements
     calibrator.record_measurement("hi", "Kavya", 100, 10.0)  # 10.0 cps

@@ -39,6 +39,12 @@ class CircuitBreaker:
         self.consecutive_failures = 0
         self.state = "CLOSED"
 
+    def trip(self) -> None:
+        """Forces the circuit breaker to OPEN state immediately."""
+        self.state = "OPEN"
+        self.consecutive_failures = self.failure_threshold
+        self.last_failure_time = time.time()
+
     def record_failure(self, status_code: int) -> None:
         if status_code >= 500:
             self.consecutive_failures += 1
@@ -137,19 +143,24 @@ async def execute_with_resilience(
 
                 # Check for 429 / 5xx to trigger retry
                 if resp.status_code == 429:
-                    retry_after_str = resp.headers.get("Retry-After")
-                    base_wait = 1.5**attempt.retry_state.attempt_number
-                    wait_sec = parse_retry_after(retry_after_str, default_backoff=base_wait)
-                    wait_sec += random.uniform(0.1, 0.5)
-                    # Semaphore is released before sleeping!
-                    await asyncio.sleep(wait_sec)
+                    # C1: Do not sleep after final attempt (only between attempts)
+                    if attempt.retry_state.attempt_number < max_attempts:
+                        retry_after_str = resp.headers.get("Retry-After")
+                        base_backoff = 1.5**attempt.retry_state.attempt_number
+                        if retry_after_str:
+                            parsed_wait = parse_retry_after(retry_after_str, default_backoff=base_backoff)
+                            wait_sec = max(parsed_wait, base_backoff)
+                        else:
+                            wait_sec = base_backoff
+                        wait_sec += random.uniform(0.1, 0.5)
+                        # Semaphore is released before sleeping!
+                        await asyncio.sleep(wait_sec)
                     if resp._request is None:
                         resp._request = httpx.Request("POST", "https://api.bodhan.ai")
                     resp.raise_for_status()
 
                 elif resp.status_code >= 500:
-                    if circuit_breaker:
-                        circuit_breaker.record_failure(resp.status_code)
+                    # C1: Do not record failure here; HTTPStatusError catch below records once per attempt
                     if resp._request is None:
                         resp._request = httpx.Request("POST", "https://api.bodhan.ai")
                     resp.raise_for_status()

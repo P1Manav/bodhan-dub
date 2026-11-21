@@ -12,17 +12,61 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
-# Regex pattern to detect sensitive api-key style strings for redaction
-SECRET_PATTERN = re.compile(r"sk-[a-zA-Z0-9_-]{16,}")
+# Regex patterns to detect sensitive API keys and auth headers
+SECRET_PATTERNS = [
+    re.compile(r"Bearer\s+[A-Za-z0-9_\-\.]+", re.IGNORECASE),
+    re.compile(r"sk-[a-zA-Z0-9_-]{8,}"),
+    re.compile(r"gsk_[a-zA-Z0-9_-]{8,}"),
+    re.compile(r"AIza[a-zA-Z0-9_-]{16,}"),
+]
+
+_REGISTERED_SECRETS: Set[str] = set()
+
+
+def register_secret(secret: Optional[str]) -> None:
+    """Registers a secret key/token to be redacted from all log output."""
+    if secret and isinstance(secret, str) and len(secret.strip()) >= 4:
+        _REGISTERED_SECRETS.add(secret.strip())
 
 
 def sanitize_text(text: str) -> str:
-    """Replaces API keys in log strings with safe redacted placeholders."""
+    """Replaces API keys and registered secrets in strings with safe redacted placeholders."""
     if not isinstance(text, str):
         return text
-    return SECRET_PATTERN.sub(lambda m: f"{m.group(0)[:6]}...{m.group(0)[-4:]}", text)
+    sanitized = text
+    # First redact explicitly registered secret values
+    for sec in sorted(_REGISTERED_SECRETS, key=len, reverse=True):
+        if sec in sanitized:
+            sanitized = sanitized.replace(sec, "[REDACTED]")
+    # Next redact pattern-matching shapes (Bearer, sk-, gsk_, AIza)
+    for pat in SECRET_PATTERNS:
+        if "Bearer" in pat.pattern:
+            sanitized = pat.sub("Bearer [REDACTED]", sanitized)
+        else:
+            sanitized = pat.sub("[REDACTED]", sanitized)
+    return sanitized
+
+
+def sanitize_data(data: Any) -> Any:
+    """Recursively redacts secrets in dicts, lists, and strings."""
+    if isinstance(data, str):
+        return sanitize_text(data)
+    elif isinstance(data, dict):
+        return {k: sanitize_data(v) for k, v in data.items()}
+    elif isinstance(data, (list, tuple)):
+        res = [sanitize_data(v) for v in data]
+        return type(data)(res)
+    return data
+
+
+class SanitizingFormatter(logging.Formatter):
+    """Console formatter that automatically sanitizes all formatted output."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return sanitize_text(formatted)
 
 
 class JsonlHandler(logging.Handler):
@@ -59,7 +103,7 @@ class JsonlHandler(logging.Handler):
         }
         # Include any extra metadata passed
         if hasattr(record, "extra_data") and isinstance(record.extra_data, dict):
-            entry["extra"] = record.extra_data
+            entry["extra"] = sanitize_data(record.extra_data)
         return entry
 
     def close(self) -> None:
@@ -89,7 +133,7 @@ class PipelineLogger:
         # Console handler with clean human-readable output
         ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(level)
-        fmt = logging.Formatter(
+        fmt = SanitizingFormatter(
             "[%(asctime)s] %(levelname)-7s [%(stage)s] %(message)s",
             datefmt="%H:%M:%S",
         )
@@ -112,16 +156,18 @@ class PipelineLogger:
         attempt: int = 1,
         **extra: Any,
     ) -> None:
+        sanitized_msg = sanitize_text(msg)
+        sanitized_extra = sanitize_data(extra) if extra else None
         self.logger.log(
             level,
-            msg,
+            sanitized_msg,
             extra={
                 "run_id": self.run_id,
                 "stage": stage,
                 "lang": lang,
                 "segment_id": segment_id,
                 "attempt": attempt,
-                "extra_data": extra if extra else None,
+                "extra_data": sanitized_extra,
             },
         )
 
@@ -143,5 +189,10 @@ class PipelineLogger:
             h.flush()
 
     def save_log(self, filepath: Optional[Path] = None) -> None:
-        """Flushes active handlers to disk."""
+        """Flushes active handlers to disk and ensures log file exists."""
         self.flush()
+        if filepath:
+            filepath = Path(filepath)
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            if not filepath.exists():
+                filepath.touch()

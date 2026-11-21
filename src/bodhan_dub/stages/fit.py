@@ -19,7 +19,12 @@ from bodhan_dub.languages import LanguageRegistry
 from bodhan_dub.logging import PipelineLogger
 from bodhan_dub.media.audio_proc import time_stretch_audio
 from bodhan_dub.policy import guard_llm_output_english_only
-from bodhan_dub.stages.qa import QAMetrics, SpeechQA, SynthesisCandidate
+from bodhan_dub.stages.qa import (
+    QAMetrics,
+    SpeechQA,
+    SynthesisCandidate,
+    determine_retry_action,
+)
 from bodhan_dub.stages.translate import check_dominant_script
 from bodhan_dub.stages.tts import CPSCalibrator, TTSSynthesizer
 from bodhan_dub.text.spans import verify_numbers_preserved
@@ -75,11 +80,22 @@ class SegmentFitController:
         speech_qa: Optional[SpeechQA] = None,
         calibrator: Optional[CPSCalibrator] = None,
         registry: Optional[LanguageRegistry] = None,
+        settings: Optional[Any] = None,
+        cer_warn: Optional[float] = None,
+        cer_fail: Optional[float] = None,
+        cer_degraded_max: Optional[float] = None,
+        max_latin_share: Optional[float] = None,
     ):
         self.bodhan_client = bodhan_client
         self.llm_client = llm_client
         self.logger = logger
         self.registry = registry
+        self.settings = settings
+        self.cer_warn = cer_warn if cer_warn is not None else (getattr(settings, "cer_warn", 0.15) if settings else 0.15)
+        self.cer_fail = cer_fail if cer_fail is not None else (getattr(settings, "cer_fail", 0.30) if settings else 0.30)
+        self.cer_degraded_max = cer_degraded_max if cer_degraded_max is not None else (getattr(settings, "cer_degraded_max", 0.45) if settings else 0.45)
+        self.max_latin_share = max_latin_share if max_latin_share is not None else (getattr(settings, "max_latin_share", 0.30) if settings else 0.30)
+
         self.calibrator = calibrator or CPSCalibrator()
         self.synthesizer = tts_synthesizer or (
             TTSSynthesizer(
@@ -94,6 +110,10 @@ class SegmentFitController:
             SpeechQA(
                 bodhan_client=bodhan_client,
                 logger=logger,
+                cer_warn=self.cer_warn,
+                cer_fail=self.cer_fail,
+                cer_degraded_max=self.cer_degraded_max,
+                max_latin_share=self.max_latin_share,
             )
             if bodhan_client is not None
             else None
@@ -232,9 +252,12 @@ class SegmentFitController:
 
         # Check if initial translation is missing or purely Latin/English
         is_script_valid = False
+        effective_max_latin = 0.70 if code_mixed else self.max_latin_share
         if current_tr:
             if self.registry:
-                is_script_valid, _ = check_dominant_script(current_tr, lang, self.registry)
+                is_script_valid, _ = check_dominant_script(
+                    current_tr, lang, self.registry, max_latin_share=effective_max_latin
+                )
             else:
                 is_script_valid = True
 
@@ -290,7 +313,9 @@ class SegmentFitController:
                         segment_id=segment_id,
                     )
                     if re_tr_text and re_tr_text.strip():
-                        if not self.registry or check_dominant_script(re_tr_text, lang, self.registry)[0]:
+                        if not self.registry or check_dominant_script(
+                            re_tr_text, lang, self.registry, max_latin_share=effective_max_latin
+                        )[0]:
                             current_tr = re_tr_text.strip()
                 except (BudgetExceededError, CircuitBreakerOpen):
                     raise
@@ -335,11 +360,23 @@ class SegmentFitController:
                     lang=lang,
                     segment_id=segment_id,
                 )
+                # A5: When a synth exception occurs, the next attempt must use a nonce
+                last_nonce = attempts + 1
                 audio_48k = np.array([], dtype=np.float32)
                 actual_dur = 0.0
                 p_dur = predicted_dur
 
             # Evaluate QA
+            is_warmed_up = (
+                self.synthesizer.calibrator.is_warmed_up(lang, voice)
+                if (self.synthesizer and hasattr(self.synthesizer, "calibrator"))
+                else True
+            )
+            eval_kwargs = {}
+            import inspect
+            if hasattr(self.speech_qa, "evaluate") and "is_warmed_up" in inspect.signature(self.speech_qa.evaluate).parameters:
+                eval_kwargs["is_warmed_up"] = is_warmed_up
+
             if self.speech_qa and len(audio_48k) > 0:
                 qa_metrics = await self.speech_qa.evaluate(
                     audio_48k=audio_48k,
@@ -347,6 +384,7 @@ class SegmentFitController:
                     predicted_duration=p_dur,
                     lang=lang,
                     segment_id=f"{segment_id}_a{attempts}",
+                    **eval_kwargs,
                 )
             else:
                 qa_metrics = QAMetrics(
@@ -376,17 +414,24 @@ class SegmentFitController:
 
             if attempts < 3:
                 previous_actions = [getattr(c, "action", "") for c in candidates if getattr(c, "action", None)]
-                if self.llm_client:
-                    action = await self.llm_client.plan_retry_action(
-                        failure_reasons=qa_metrics.failure_reasons,
-                        previous_actions=previous_actions,
-                        lang=lang,
-                        segment_id=segment_id,
-                    )
-                elif self.speech_qa:
-                    action = self.speech_qa.plan_retry_action(qa_metrics, attempts)
+                deterministic_action = determine_retry_action(qa_metrics.failure_reasons, attempts, previous_actions)
+                if self.llm_client and getattr(getattr(self.llm_client, "settings", None), "llm_api_key", None):
+                    try:
+                        llm_choice = await self.llm_client.plan_retry_action(
+                            failure_reasons=qa_metrics.failure_reasons,
+                            previous_actions=previous_actions,
+                            lang=lang,
+                            segment_id=segment_id,
+                        )
+                        valid_choices = ["split_text", "paraphrase_source", "condense", "retry_same"]
+                        if llm_choice in valid_choices and llm_choice not in previous_actions:
+                            action = llm_choice
+                        else:
+                            action = deterministic_action
+                    except Exception:
+                        action = deterministic_action
                 else:
-                    action = "retry_same"
+                    action = deterministic_action
                 cand.action = action
                 self.logger.info(
                     f"QA failed on attempt {attempts} (reasons: {qa_metrics.failure_reasons}); planning action: {action}",
@@ -415,7 +460,9 @@ class SegmentFitController:
                                 segment_id=segment_id,
                             )
                             if tr_text and tr_text.strip():
-                                if not self.registry or check_dominant_script(tr_text, lang, self.registry)[0]:
+                                if not self.registry or check_dominant_script(
+                                    tr_text, lang, self.registry, max_latin_share=effective_max_latin
+                                )[0]:
                                     current_tr = tr_text.strip()
                         except (BudgetExceededError, CircuitBreakerOpen):
                             raise
@@ -444,7 +491,9 @@ class SegmentFitController:
                                 segment_id=segment_id,
                             )
                             if tr_text and tr_text.strip():
-                                if not self.registry or check_dominant_script(tr_text, lang, self.registry)[0]:
+                                if not self.registry or check_dominant_script(
+                                    tr_text, lang, self.registry, max_latin_share=effective_max_latin
+                                )[0]:
                                     current_tr = tr_text.strip()
                         except (BudgetExceededError, CircuitBreakerOpen):
                             raise
@@ -467,7 +516,11 @@ class SegmentFitController:
             if valid_cands:
                 valid_cands.sort(key=lambda c: c.metrics.cer)
                 best = valid_cands[0]
-                if best.metrics.cer < 0.45 and not best.metrics.is_silent:
+                if (
+                    best.metrics.cer is not None
+                    and best.metrics.cer < self.cer_degraded_max
+                    and not best.metrics.is_silent
+                ):
                     chosen_candidate = best
                     qa_status = "degraded"
                 else:
@@ -539,10 +592,53 @@ class SegmentFitController:
                             segment_id=f"{segment_id}_condense{condense_passes}",
                         )
                         if len(re_audio) > 0:
-                            current_en = condensed
-                            current_tr = re_tr.strip()
-                            audio = re_audio
-                            raw_dur = re_dur
+                            # A3: Evaluate QA on the new audio
+                            if self.speech_qa:
+                                re_qa = await self.speech_qa.evaluate(
+                                    audio_48k=re_audio,
+                                    reference_text=re_tr.strip(),
+                                    predicted_duration=re_dur,
+                                    lang=lang,
+                                    segment_id=f"{segment_id}_condense{condense_passes}",
+                                    is_warmed_up=True,
+                                )
+                            else:
+                                re_qa = QAMetrics(cer=0.0, passed=True, failure_reasons=[])
+
+                            # Accept new candidate ONLY if:
+                            # 1) actually shorter than current audio (re_dur < raw_dur)
+                            # AND 2) passes QA or has a lower CER than current candidate
+                            current_cer = (
+                                chosen_candidate.metrics.cer
+                                if (chosen_candidate and chosen_candidate.metrics)
+                                else 1.0
+                            )
+                            is_cer_improved = (
+                                re_qa.cer is not None
+                                and current_cer is not None
+                                and re_qa.cer < current_cer
+                            )
+
+                            if re_dur < raw_dur and (re_qa.passed or is_cer_improved):
+                                current_en = condensed
+                                current_tr = re_tr.strip()
+                                audio = re_audio
+                                raw_dur = re_dur
+                                chosen_candidate = SynthesisCandidate(
+                                    attempt=chosen_candidate.attempt if chosen_candidate else 1,
+                                    text=current_tr,
+                                    audio_48k=audio,
+                                    duration_s=raw_dur,
+                                    metrics=re_qa,
+                                )
+                            else:
+                                self.logger.info(
+                                    f"Condense candidate rejected (re_dur={re_dur:.2f}s vs curr={raw_dur:.2f}s, "
+                                    f"passed={re_qa.passed}, cer={re_qa.cer} vs curr={current_cer})",
+                                    stage="fit",
+                                    lang=lang,
+                                    segment_id=segment_id,
+                                )
             except (BudgetExceededError, CircuitBreakerOpen):
                 raise
             except Exception as e:

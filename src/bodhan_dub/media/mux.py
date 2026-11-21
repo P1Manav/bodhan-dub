@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -92,6 +92,28 @@ def get_stream_start_time(probe_data: dict, codec_type: str) -> float:
         return float(probe_data.get("format", {}).get("start_time", 0.0))
     except ValueError:
         return 0.0
+
+
+def decode_muxed_audio(mp4_path: Path) -> Tuple[np.ndarray, int]:
+    """D8: Decodes the primary audio stream from an MP4 container using ffmpeg pipe."""
+    import io
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        str(mp4_path),
+        "-f",
+        "wav",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+        "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=True)
+    data, sr = sf.read(io.BytesIO(proc.stdout), dtype="float32")
+    return data, sr
 
 
 def mux_video_audio(
@@ -256,25 +278,44 @@ def mux_and_verify(
             input_delta_ms = abs(v_dur - target_video_dur) * 1000.0
 
             if delta_ms <= 100.0 and input_delta_ms <= 100.0:
-                # Measure loudness of muxed audio
+                # D8: Measure loudness of DECODED muxed audio
                 meas_lufs = None
                 meas_tp = None
                 try:
-                    aud_data, aud_sr = sf.read(str(current_audio_path), dtype="float32")
-                    meas_lufs = measure_loudness(aud_data, aud_sr)
-                    meas_tp = measure_true_peak_dbtp(aud_data)
-                    if meas_lufs > -60.0:
-                        if meas_lufs < -17.0 or meas_lufs > -15.0 or meas_tp > -1.0:
-                            loudness_err = (
-                                f"Mux loudness check failed: measured {meas_lufs:.2f} LUFS / "
-                                f"{meas_tp:.2f} dBTP (requires -16±1 LUFS and <= -1 dBTP)"
-                            )
-                            if raise_on_failure:
-                                raise MuxError(loudness_err)
-                except MuxError:
-                    raise
+                    dec_audio, dec_sr = decode_muxed_audio(output_mp4_path)
+                    meas_lufs = measure_loudness(dec_audio, dec_sr)
+                    meas_tp = measure_true_peak_dbtp(dec_audio)
                 except Exception as ex:
-                    logger.warning(f"Could not verify audio loudness on mux: {ex}", stage="mux")
+                    logger.warning(f"Could not decode audio from MP4: {ex}; checking WAV directly", stage="mux")
+                    try:
+                        aud_data, aud_sr = sf.read(str(current_audio_path), dtype="float32")
+                        meas_lufs = measure_loudness(aud_data, aud_sr)
+                        meas_tp = measure_true_peak_dbtp(aud_data)
+                    except Exception:
+                        pass
+
+                loudness_out_of_bounds = False
+                if meas_lufs is not None and meas_lufs > -60.0:
+                    if meas_lufs < -17.0 or meas_lufs > -15.0 or (meas_tp is not None and meas_tp > -1.0):
+                        loudness_out_of_bounds = True
+
+                if loudness_out_of_bounds and repair_attempts < 2:
+                    repair_attempts += 1
+                    logger.warning(
+                        f"Mux loudness out of bounds ({meas_lufs:.2f} LUFS, {meas_tp:.2f} dBTP); attempting gain-trim repair {repair_attempts}",
+                        stage="mux_repair",
+                        lang=lang,
+                    )
+                    from bodhan_dub.media.loudness import apply_true_peak_limiter
+                    repaired_wav_path = output_mp4_path.parent / f"repaired_loudness_a{repair_attempts}.wav"
+                    created_repairs.append(repaired_wav_path)
+                    audio_data, sr = sf.read(str(current_audio_path), dtype="float32")
+                    delta_db = float(np.clip(-16.0 - meas_lufs, -3.0, 3.0))
+                    trimmed = audio_data * (10.0 ** (delta_db / 20.0))
+                    trimmed = apply_true_peak_limiter(trimmed, max_peak_dbtp=-1.0, sample_rate=sr)
+                    sf.write(str(repaired_wav_path), trimmed, sr, subtype="PCM_16")
+                    current_audio_path = repaired_wav_path
+                    continue
 
                 # B12: Clean up intermediate repaired audio files on success
                 for rep in created_repairs:
@@ -283,6 +324,11 @@ def mux_and_verify(
                     except Exception:
                         pass
 
+                err_msg = (
+                    f"Mux loudness out of bounds after repairs ({meas_lufs:.2f} LUFS, {meas_tp:.2f} dBTP)"
+                    if loudness_out_of_bounds
+                    else None
+                )
                 return MuxResult(
                     output_path=str(output_mp4_path),
                     video_duration_s=round(v_dur, 3),
@@ -292,6 +338,7 @@ def mux_and_verify(
                     repair_attempts=repair_attempts,
                     measured_lufs=round(meas_lufs, 2) if meas_lufs is not None else None,
                     measured_tp_dbtp=round(meas_tp, 2) if meas_tp is not None else None,
+                    error=err_msg,
                 )
 
             # If duration delta > 100ms and repairs left, pad/trim audio WAV to exact video duration

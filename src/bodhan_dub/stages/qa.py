@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import scipy.signal
@@ -25,8 +25,9 @@ from bodhan_dub.text.normalize import detect_repeated_ngrams
 
 
 class QAMetrics(BaseModel):
-    cer: float
+    cer: Optional[float] = None
     passed: bool
+    verified: bool = True
     has_repetition: bool = False
     has_tail_omission: bool = False
     duration_ratio: float = 1.0  # actual / predicted
@@ -34,6 +35,51 @@ class QAMetrics(BaseModel):
     is_clipped: bool = False
     is_empty: bool = False
     failure_reasons: List[str] = Field(default_factory=list)
+
+
+def determine_retry_action(
+    failure_reasons: List[str],
+    attempt: int = 1,
+    previous_actions: Optional[List[str]] = None,
+) -> str:
+    """
+    D1: Deterministic mapping from failure reasons to corrective action:
+    - tail_omission_ or repetition_ -> split_text
+    - duration_mismatch_ratio_ > 1.0 -> condense
+    - cer_high_ -> paraphrase_source if attempt == 1 else condense
+    - audio_clipping or internal_silence -> retry_same
+    - default -> retry_same
+    Never repeats an action in previous_actions.
+    """
+    prev = previous_actions or []
+    candidate_action = "retry_same"
+
+    if any(r.startswith("tail_omission") or r.startswith("repetition") for r in failure_reasons):
+        candidate_action = "split_text"
+    elif any(r.startswith("duration_mismatch_ratio_") for r in failure_reasons):
+        ratio = 1.5
+        for r in failure_reasons:
+            if r.startswith("duration_mismatch_ratio_"):
+                parts = r.split("_")
+                try:
+                    ratio = float(parts[-1].replace("advisory", ""))
+                except Exception:
+                    pass
+        candidate_action = "condense" if ratio > 1.0 else "retry_same"
+    elif any(r.startswith("cer_high_") for r in failure_reasons):
+        candidate_action = "paraphrase_source" if attempt == 1 else "condense"
+    elif any(r in ("audio_clipping", "internal_silence") for r in failure_reasons):
+        candidate_action = "retry_same"
+
+    # Avoid repeating strategies
+    fallback_ladder = ["split_text", "paraphrase_source", "condense", "retry_same"]
+    if candidate_action in prev:
+        for fb in fallback_ladder:
+            if fb not in prev:
+                return fb
+        return "retry_same"
+
+    return candidate_action
 
 
 @dataclass
@@ -67,15 +113,19 @@ class SpeechQA:
 
     def __init__(
         self,
-        bodhan_client: BodhanClient,
+        bodhan_client: Optional[BodhanClient],
         logger: PipelineLogger,
         cer_warn: float = 0.15,
         cer_fail: float = 0.30,
+        cer_degraded_max: float = 0.45,
+        max_latin_share: float = 0.30,
     ):
         self.bodhan_client = bodhan_client
         self.logger = logger
         self.cer_warn = cer_warn
         self.cer_fail = cer_fail
+        self.cer_degraded_max = cer_degraded_max
+        self.max_latin_share = max_latin_share
 
     async def evaluate(
         self,
@@ -84,6 +134,7 @@ class SpeechQA:
         predicted_duration: float,
         lang: str,
         segment_id: str,
+        is_warmed_up: bool = True,
     ) -> QAMetrics:
         """
         Back-transcribes synthesized audio and checks CER, repetitions, omissions, and clipping.
@@ -104,9 +155,18 @@ class SpeechQA:
             reasons.append("internal_silence")
 
         dur_ratio = actual_dur / max(0.1, predicted_duration)
-        is_duration_mismatch = (dur_ratio < 0.65 or dur_ratio > 1.35)
-        if is_duration_mismatch:
-            reasons.append(f"duration_mismatch_ratio_{dur_ratio:.2f}")
+        # Bounds per spec [0.60, 1.60]
+        raw_mismatch = (dur_ratio < 0.60 or dur_ratio > 1.60)
+        if raw_mismatch:
+            if not is_warmed_up:
+                # A6: Warmup segments treat duration-vs-prediction check as advisory (not a QA failure)
+                reasons.append(f"duration_mismatch_ratio_{dur_ratio:.2f}_advisory")
+                is_duration_mismatch = False
+            else:
+                reasons.append(f"duration_mismatch_ratio_{dur_ratio:.2f}")
+                is_duration_mismatch = True
+        else:
+            is_duration_mismatch = False
 
         # Back-transcription with Indic-Transcribe
         wav_16k_bytes = convert_48k_to_16k_wav_bytes(audio_48k)
@@ -169,35 +229,55 @@ class SpeechQA:
                 and (not silent)
                 and (not is_duration_mismatch)
             )
+            return QAMetrics(
+                cer=round(cer, 4),
+                passed=passed,
+                verified=True,
+                has_repetition=has_repeat,
+                has_tail_omission=has_tail_omission,
+                duration_ratio=round(dur_ratio, 2),
+                is_silent=silent,
+                is_clipped=clipped,
+                is_empty=False,
+                failure_reasons=reasons,
+            )
         else:
-            cer = 0.0
-            # If back-transcription endpoint failed, acoustic passes if no audio flaws
+            # D3: When back-transcription fails, cer=None, verified=False
             passed = (not clipped) and (not silent) and (not is_duration_mismatch)
-
-        return QAMetrics(
-            cer=round(cer, 4),
-            passed=passed,
-            has_repetition=has_repeat,
-            has_tail_omission=has_tail_omission,
-            duration_ratio=round(dur_ratio, 2),
-            is_silent=silent,
-            is_clipped=clipped,
-            is_empty=False,
-            failure_reasons=reasons,
-        )
+            return QAMetrics(
+                cer=None,
+                passed=passed,
+                verified=False,
+                has_repetition=False,
+                has_tail_omission=False,
+                duration_ratio=round(dur_ratio, 2),
+                is_silent=silent,
+                is_clipped=clipped,
+                is_empty=False,
+                failure_reasons=reasons,
+            )
 
     def plan_retry_action(
         self,
         metrics: QAMetrics,
-        attempt: int,
+        attempt: int = 1,
+        previous_actions: Optional[List[str]] = None,
     ) -> str:
         """
-        Chooses corrective action from: 'split_text', 'paraphrase_source', 'condense', 'retry_same'.
+        Chooses corrective action using deterministic unified logic:
+        'split_text', 'paraphrase_source', 'condense', 'retry_same'.
         """
-        if metrics.has_tail_omission or metrics.has_repetition:
-            return "split_text"
-        if metrics.cer >= self.cer_fail:
-            return "paraphrase_source" if attempt == 1 else "condense"
-        if metrics.duration_ratio > 1.3:
-            return "condense"
-        return "retry_same"
+        reasons = list(metrics.failure_reasons)
+        if metrics.has_tail_omission and not any(r.startswith("tail_omission") for r in reasons):
+            reasons.append("tail_omission")
+        if metrics.has_repetition and not any(r.startswith("repetition") for r in reasons):
+            reasons.append("repetition")
+        if metrics.cer is not None and metrics.cer >= self.cer_fail and not any(r.startswith("cer_high") for r in reasons):
+            reasons.append(f"cer_high_{metrics.cer:.3f}")
+        if (metrics.duration_ratio < 0.60 or metrics.duration_ratio > 1.20) and not any(r.startswith("duration_mismatch_ratio") for r in reasons):
+            reasons.append(f"duration_mismatch_ratio_{metrics.duration_ratio:.2f}")
+        if metrics.is_clipped and "audio_clipping" not in reasons:
+            reasons.append("audio_clipping")
+        if metrics.is_silent and "internal_silence" not in reasons:
+            reasons.append("internal_silence")
+        return determine_retry_action(reasons, attempt, previous_actions)

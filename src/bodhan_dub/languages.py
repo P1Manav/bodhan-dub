@@ -91,6 +91,18 @@ class LanguageRegistry:
     def get_info(self, code: str) -> Optional[LanguageInfo]:
         return self.production_tier.get(code)
 
+    def get_voices(self, lang: str) -> List[str]:
+        """Returns all available voice names (female and male) for a given language."""
+        info = self.production_tier.get(lang)
+        if not info or not info.tts_voices:
+            return []
+        voices: List[str] = []
+        if info.tts_voices.female:
+            voices.extend(info.tts_voices.female)
+        if info.tts_voices.male:
+            voices.extend(info.tts_voices.male)
+        return voices
+
     def get_default_voice(
         self, lang: str, gender: str = "female", custom_voices: Optional[Dict[str, Any]] = None
     ) -> str:

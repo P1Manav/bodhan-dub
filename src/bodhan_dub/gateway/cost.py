@@ -162,7 +162,7 @@ class BudgetGuard:
                 )
 
     def reserve(self, estimated_cost: float):
-        """B18: Context manager reserving estimated cost before call and reconciling after."""
+        """C2: Context manager reserving estimated cost before call and reconciling after."""
         class _ReservationContext:
             def __init__(self, guard: BudgetGuard, amount: float):
                 self.guard = guard
@@ -170,8 +170,16 @@ class BudgetGuard:
 
             async def __aenter__(self):
                 if self.guard.max_cost_inr is not None and self.guard.max_cost_inr > 0.0:
-                    await self.guard.check_budget(self.amount)
+                    current_total = await self.guard.ledger.get_total_inr()
                     async with self.guard._lock:
+                        effective_total = current_total + self.guard.reserved_inr + self.amount
+                        if effective_total > self.guard.max_cost_inr:
+                            raise BudgetExceededError(
+                                f"Budget limit exceeded! Current spend: ₹{current_total:.2f}, "
+                                f"Reserved: ₹{self.guard.reserved_inr:.2f}, "
+                                f"Attempted call estimate: ₹{self.amount:.2f}, "
+                                f"Budget ceiling: ₹{self.guard.max_cost_inr:.2f}."
+                            )
                         self.guard.reserved_inr += self.amount
                 return self
 

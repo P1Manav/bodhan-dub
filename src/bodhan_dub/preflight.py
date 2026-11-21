@@ -9,7 +9,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from bodhan_dub.config import Settings
 from bodhan_dub.languages import LanguageRegistry
@@ -218,6 +218,57 @@ def estimate_pipeline_cost(
     }
 
 
+def validate_voices_mapping(
+    voices_arg: Optional[Union[str, Path]],
+    registry: LanguageRegistry,
+) -> Dict[str, str]:
+    """
+    C5: Validates custom voices specification against LanguageRegistry.
+    Raises PreflightError if any specified language or voice is unknown.
+    """
+    if not voices_arg:
+        return {}
+
+    custom_voices: Dict[str, str] = {}
+    v_path = Path(str(voices_arg))
+    if v_path.exists() and v_path.is_file():
+        import yaml
+        try:
+            content = yaml.safe_load(v_path.read_text(encoding="utf-8"))
+            if isinstance(content, dict):
+                custom_voices = {str(k).strip(): str(v).strip() for k, v in content.items()}
+        except Exception as e:
+            raise PreflightError(f"Failed to parse custom voices file '{v_path}': {e}")
+    else:
+        # Parse comma-separated "lang:voice" pairs (e.g. "hi:invalid_voice" or "hi:Kavya,ta:Deepa")
+        raw_str = str(voices_arg).strip()
+        for pair in raw_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if ":" not in pair:
+                raise PreflightError(f"Invalid --voices format '{pair}'. Expected 'lang:voice' or a YAML file.")
+            l_code, v_name = pair.split(":", 1)
+            custom_voices[l_code.strip()] = v_name.strip()
+
+    # Validate against registry
+    supported_langs = registry.get_supported_target_codes()
+    for l_code, v_name in custom_voices.items():
+        if l_code not in registry.production_tier:
+            raise PreflightError(
+                f"Unsupported language '{l_code}' in --voices. "
+                f"Supported languages: {', '.join(supported_langs)}"
+            )
+        allowed_voices = registry.get_voices(l_code)
+        if v_name not in allowed_voices:
+            raise PreflightError(
+                f"Unknown voice '{v_name}' for language '{l_code}' in --voices. "
+                f"Allowed voices for '{l_code}': {', '.join(allowed_voices) if allowed_voices else 'None'}"
+            )
+
+    return custom_voices
+
+
 def run_preflight_checks(
     input_path: Path,
     target_langs: List[str],
@@ -225,6 +276,7 @@ def run_preflight_checks(
     registry: LanguageRegistry,
     estimate_only: bool = False,
     mock_mode: bool = False,
+    voices_arg: Optional[Union[str, Path]] = None,
 ) -> Tuple[MediaInfo, Dict[str, float]]:
     """Runs all preflight checks, raising PreflightError on failure."""
     # 1. System tools
@@ -242,6 +294,10 @@ def run_preflight_checks(
 
     # 3. Target languages validation
     valid_langs = registry.validate_target_langs(target_langs)
+
+    # C5: Validate custom voices against registry
+    if voices_arg:
+        validate_voices_mapping(voices_arg, registry)
 
     # 4. API keys check (unless mock mode)
     if not mock_mode:

@@ -55,7 +55,7 @@ def check_dominant_script(
     target_lang: str,
     registry: LanguageRegistry,
     min_indic_ratio: float = 0.5,
-    max_latin_share: float = 0.45,
+    max_latin_share: float = 0.40,
 ) -> Tuple[bool, str]:
     """
     B17: Checks that the text is written in the expected Indic script.
@@ -118,11 +118,12 @@ def run_translation_structural_checks(
     target_text: str,
     target_lang: str,
     registry: LanguageRegistry,
+    max_latin_share: float = 0.30,
 ) -> Tuple[bool, Optional[str]]:
     """
     B17: Runs deterministic validation checks on translated Indic text:
     1. Non-empty
-    2. Dominant script (with <= 30% Latin share)
+    2. Dominant script (with <= max_latin_share Latin share)
     3. Numbers preserved
     4. Dynamic length ratio bounds based on source length
     5. No repeated n-grams / looping
@@ -155,23 +156,9 @@ def run_translation_structural_checks(
         return False, f"abnormal_length_ratio_{ratio:.2f} (allowed {min_ratio:.2f}-{max_ratio:.2f})"
 
     # Dominant script check
-    script_ok, reason = check_dominant_script(t_clean, target_lang, registry)
-    if not script_ok:
-        return False, reason
-
-    # Numbers preservation
-    if not verify_numbers_preserved(s_clean, t_clean):
-        return False, "number_mismatch"
-
-    # Repeated n-gram looping
-    is_loop, phrase = detect_repeated_ngrams(t_clean, min_n=1, max_n=3, repeat_threshold=3)
-    if is_loop:
-        return False, f"repeated_ngram_loop_{phrase}"
-
-    return True, None
-
-    # Dominant script check
-    script_ok, reason = check_dominant_script(t_clean, target_lang, registry)
+    script_ok, reason = check_dominant_script(
+        t_clean, target_lang, registry, max_latin_share=max_latin_share
+    )
     if not script_ok:
         return False, reason
 
@@ -292,27 +279,37 @@ class TranslationStage:
         segment_id = seg.id
         source_text = seg.text
 
-        # Target language code
+        # Target language code (keep valid target language code, raise max_latin_share if code-mixed)
         target_code = target_lang
-        if self.code_mixed:
-            info = self.registry.get_info(target_lang)
-            if info and info.code_mixed_target:
-                target_code = info.code_mixed_target
+        effective_max_latin = 0.70 if self.code_mixed else 0.30
 
         terms_to_protect = glossary.get_terms_for_text(source_text)
         canonical_map = {
             t.lower(): glossary.get_canonical(t, target_lang) for t in terms_to_protect
         }
 
-        # Step 1: Translate with placeholders
+        # Step 1: Translate with placeholders (if any)
         protected_text, ph_map = protect_terms(source_text, terms_to_protect)
 
         last_text: Optional[str] = None
         last_failure_reason: Optional[str] = None
 
         for attempt in range(1, 4):
-            use_placeholders = attempt == 1 and bool(ph_map)
-            text_to_translate = protected_text if use_placeholders else source_text
+            # D5: Step 1 uses placeholders if available; Step 2 explicitly drops placeholders; Step 3 paraphrases
+            if attempt == 1:
+                use_placeholders = bool(ph_map)
+                text_to_translate = protected_text if use_placeholders else source_text
+            elif attempt == 2:
+                # Step 2: Distinct call without placeholders
+                use_placeholders = False
+                text_to_translate = source_text
+            else:
+                # Step 3: Paraphrase English source with LLM
+                use_placeholders = False
+                source_text = await self.paraphrase_source_english(
+                    source_text, target_lang, segment_id, terms_to_protect
+                )
+                text_to_translate = source_text
 
             try:
                 raw_translation, _ = await self.bodhan_client.translate(
@@ -322,6 +319,7 @@ class TranslationStage:
                     stage="translate",
                     lang=target_lang,
                     segment_id=segment_id,
+                    nonce=attempt if attempt > 1 else None,
                 )
             except (BudgetExceededError, CircuitBreakerOpen):
                 raise
@@ -353,7 +351,9 @@ class TranslationStage:
                 final_text = raw_translation
 
             # Check if final_text has any Indic characters in expected script
-            is_script_ok, _ = check_dominant_script(final_text, target_lang, self.registry)
+            is_script_ok, _ = check_dominant_script(
+                final_text, target_lang, self.registry, max_latin_share=effective_max_latin
+            )
             if is_script_ok:
                 last_text = final_text
 
@@ -363,6 +363,7 @@ class TranslationStage:
                 target_text=final_text,
                 target_lang=target_lang,
                 registry=self.registry,
+                max_latin_share=effective_max_latin,
             )
 
             if checks_pass:
@@ -383,16 +384,19 @@ class TranslationStage:
                         segment_id=segment_id,
                     )
 
-                    if judge_result.verdict in ["mistranslation", "omission"]:
+                    # D5: Judge requires strong evidence and ignores benign additions
+                    evidence_clean = (judge_result.evidence or "").strip()
+                    has_strong_evidence = len(evidence_clean) >= 5
+                    if (
+                        judge_result.verdict in ["mistranslation", "omission"]
+                        and has_strong_evidence
+                    ):
                         if attempt < 3:
                             self.logger.warning(
-                                f"Back-translation judge flagged '{judge_result.verdict}': {judge_result.evidence}. Paraphrasing English source and re-translating...",
+                                f"Back-translation judge flagged '{judge_result.verdict}': {judge_result.evidence}. Re-translating on next step...",
                                 stage="translate",
                                 lang=target_lang,
                                 segment_id=segment_id,
-                            )
-                            source_text = await self.paraphrase_source_english(
-                                source_text, target_lang, segment_id, terms_to_protect
                             )
                             last_failure_reason = f"judge_{judge_result.verdict}"
                             continue

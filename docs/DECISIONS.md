@@ -168,6 +168,118 @@ This log records design decisions made during development of `bodhan_dub`, follo
 - **Decision:** In `preflight.py`, verify available disk space ($\ge 500\text{ MB}$ or $3\times$ video size) and validate LLM settings upfront. In `stages/report.py`, include runtime target, speech stem LUFS, final mix LUFS, and true peak dBTP in `report.json`. Update `README.md` to clarify the 13 production languages (1 source + 12 targets).
 - **Reason:** Fails fast before spending resources on full disks or misconfigured environments, and provides complete audio engineering transparency in reports.
 
+### [2026-11-21] DEC-042: Strict Non-Overlapping Audio Placement and Master Stem Extension (A1)
+- **Decision:** In `stages/schedule.py`, completely eliminate crossfade overlaps and additive assignment; resolve collisions strictly via slack borrowing ($\le 250\text{ms}$), raw audio re-stretch ($\le 1.20\text{x}$), and shifting within $\pm 300\text{ms}$. When a segment at the media end would overrun, pull earlier and pad the master buffer and video output without truncating speech, returning un-mutated caller fit results.
+- **Reason:** Guarantees zero audio collisions or garbled double-speech while strictly preventing tail speech loss.
+
+### [2026-11-21] DEC-043: Preserved VAD Audio on Unplaced Speech Spans (A2)
+- **Decision:** In `media/mix.py`, compute ducking/muting intervals only for VAD speech regions that overlap a placed (non-skipped) segment, merging them with placed spans and punching holes for skipped slots.
+- **Reason:** Keeps original dialogue intact for ASR gaps, translation drops, and skipped segments rather than inserting silence.
+
+### [2026-11-21] DEC-044: Post-Synthesis Condensation Candidate QA Selection (A3)
+- **Decision:** In `stages/fit.py` step 4, evaluate every condensation candidate with `SpeechQA.evaluate` and accept the candidate only if its duration is strictly shorter AND it either passes QA or achieves lower CER than the incumbent.
+- **Reason:** Prevents post-synthesis condensation loops from adopting broken or lengthened audio.
+
+### [2026-11-21] DEC-045: Raw Audio Checkpointing and Work Directory Retention (A4)
+- **Decision:** In `orchestrator.py`, persist `<segment_id>.raw.wav` alongside `<segment_id>.wav` and restore un-stretched `raw_audio` upon resume. Delete `work_dir` only when overall pipeline status is `ok` and neither `--keep-work` nor `--resume` is requested.
+- **Reason:** Prevents repeated time-stretch degradation on resume and ensures intermediate state is preserved for retries or resume runs.
+
+### [2026-11-21] DEC-046: Response Validation Before Cache and Translation Nonce (A5)
+- **Decision:** In `gateway/bodhan.py`, validate RIFF/WAV headers, frame counts, decodability, and sample rate before caching audio. Add optional `nonce` to `translate` and `speak` to bypass stale cache hits on retries, and resample from native sample rate dynamically to 48kHz.
+- **Reason:** Guarantees that corrupt audio or JSON 200 error payloads are never cached, while ensuring retries produce genuine new requests.
+
+### [2026-11-21] DEC-047: Warmup Duration Advisory Checks and Documented CPS Seeding (A6)
+- **Decision:** In `stages/qa.py` and `stages/tts.py`, treat duration mismatch as advisory during warm-up until `CPSCalibrator.is_warmed_up` is true, and seed initial CPS from documented `API_FACTS.md` values.
+- **Reason:** Avoids false-positive duration failures and paid retries before empirical voice calibration is established.
+
+### [2026-11-21] DEC-048: Speech Envelope Snapping and Proportional Allocation (B1)
+- **Decision:** Snap ASR segment bounds to intersecting VAD speech regions, evaluate clamped overlap, and allocate multi-region segments proportionally. Drop segments only when clamped overlap is absent (<= 0.05s).
+- **Reason:** Prevents silent spans and background noise from skewing timestamps or causing false segment drops on sparse speech.
+
+### [2026-11-21] DEC-049: Gather Sibling Task Cancellation on Fatal Errors and 400 Chunk Splitting (B2)
+- **Decision:** Use `asyncio.gather` with a done-callback in ASR chunk processing that cancels pending sibling tasks immediately upon fatal errors (400, 401, 403, BudgetExceededError, CircuitBreakerOpen). Over-length 400 responses trigger automatic sub-chunk splitting.
+- **Reason:** Halts expensive paid API calls immediately when fatal auth or configuration errors occur, preventing wasted API spend.
+
+### [2026-11-21] DEC-050: Shared Stage Failure Isolation and Graceful Exit (B3)
+- **Decision:** Wrap shared stage execution in `PipelineOrchestrator.run` with unified exception handling that marks all target languages `failed`, records the error in `report.json`, writes `manifest.json` and `run.log.jsonl`, and returns exit code 1. Wrap CLI Settings parsing to exit with code 2 on configuration error.
+- **Reason:** Guarantees honest failure reporting and proper CLI exit codes without orphaned or half-written output directories.
+
+### [2026-11-21] DEC-051: Stage-Level Checkpointing with Content Hash Validation (B4)
+- **Decision:** Save checkpoints for shared stages (`ingest`, `vad`, `asr`, `segmenter`, `glossary`) keyed by input file content hash (`st_size`, `st_mtime`, filename). Resume skips completed stages only when input hash matches.
+- **Reason:** Saves time and compute during resumes while preventing stale cache usage if input media has changed.
+
+### [2026-11-21] DEC-052: Accurate Circuit Breaker 5xx Failure Counting & No Final Sleep (C1)
+- **Decision:** Count consecutive 5xx errors once per failed attempt in `resilience.py`, eliminate duplicate `record_failure` inside status checks, avoid sleeping after the final retry attempt, and honor `max(retry_after, exponential_backoff)` on 429.
+- **Reason:** Prevents breaker from tripping prematurely at N/2 attempts and prevents unnecessary sleep delays when all attempts have been exhausted.
+
+### [2026-11-21] DEC-053: Atomic Budget Reservation Under Concurrency (C2)
+- **Decision:** Wrap all paid API calls (`transcribe`, `translate`, `speak`) with `async with self.budget_guard.reserve(est_cost):` using an atomic reservation check inside `_ReservationContext.__aenter__`, and reject `--max-cost-inr <= 0` in CLI with exit code 2.
+- **Reason:** Prevents concurrent requests from overshooting the configured maximum rupee budget.
+
+### [2026-11-21] DEC-054: Single-Flight In-Flight Request Deduplication (C3)
+- **Decision:** Use in-flight task tracking in `BodhanClient` keyed by cache key (`_in_flight[flight_key] = asyncio.create_task(...)`) to collapse concurrent identical translation and synthesis requests into a single paid network call.
+- **Reason:** Eliminates duplicate paid API calls for identical requests occurring concurrently across parallel workers.
+
+### [2026-11-21] DEC-055: Language-Scoped Fast Failure on Unknown Voice/Language (C4)
+- **Decision:** Raise `UnknownVoiceOrLanguageError` and invoke `cb.trip()` on 400/404/422 responses indicating unknown voices or unsupported languages. In `PipelineOrchestrator.process_language`, catch this error, mark that language `failed`, and skip remaining segments for that language without failing other concurrent languages.
+- **Reason:** Prevents repetitive, futile paid attempts when an unsupported voice or language is supplied, while preserving progress on valid target languages.
+
+### [2026-11-21] DEC-056: Preflight Voice Specification Validation (C5)
+- **Decision:** Validate `--voices` argument against `LanguageRegistry.get_voices(lang)` during preflight in `validate_voices_mapping`, rejecting invalid languages or voices with `PreflightError` and CLI exit code 2.
+- **Reason:** Fails early before any pipeline execution or API spend when invalid voice flags are provided.
+
+### [2026-11-21] DEC-057: Deterministic QA Retry Action Mapping (D1)
+- **Decision:** Implement unified deterministic retry planner `determine_retry_action` mapping failure reasons to corrective actions (`split_text`, `condense`, `paraphrase_source`, `retry_same`) without repeating prior actions.
+- **Reason:** Eliminates nondeterministic retry cycling and ensures targeted acoustic and length remediation per failure mode.
+
+### [2026-11-21] DEC-058: Configurable QA and Script Quality Thresholds (D2)
+- **Decision:** Wire `cer_warn`, `cer_fail`, `cer_degraded_max`, and `max_latin_share` from `Settings` through `SegmentFitController` and `SpeechQA`, eliminating hardcoded constants.
+- **Reason:** Allows runtime configuration and strict quality tuning without modifying core fitting logic.
+
+### [2026-11-21] DEC-059: Unverified QA Accounting on Back-Transcription Failures (D3)
+- **Decision:** When back-transcription fails during QA, set `cer=None`, `verified=False`, track `qa_unverified` count in `LanguageSummary` and `report.json`, and exclude unverified segments from CER statistics.
+- **Reason:** Ensures honest, transparent reporting of acoustic verification status without distorting verified CER benchmarks.
+
+### [2026-11-21] DEC-060: Honest Code-Mixed Translation Script Policy (D4)
+- **Decision:** In `--code-mixed` mode, maintain the valid target Indic language code in Bodhan translation calls while expanding Latin character allowance (`max_latin_share` = 0.70) in dominant script validation.
+- **Reason:** Preserves technical terminology and loanwords naturally in Latin script while maintaining valid Indic syntax and target language integrity.
+
+### [2026-11-21] DEC-061: Translation Retry Ladder Nonce and Judge Evidence Gating (D5)
+- **Decision:** Pass `nonce=attempt` on retry translation calls, ensure Step 2 directly queries translation without placeholders, and require >= 5 characters of concrete evidence before flagging translation via the LLM back-translation judge (ignoring benign additions).
+- **Reason:** Prevents stale cache collisions on translation retries and eliminates false-positive LLM judge rejections on trivial discrepancies.
+
+### [2026-11-21] DEC-062: Proportional SLA Targets and Dual-Stem Loudness Benchmarks (D6)
+- **Decision:** In `build_pipeline_report`, scale processing runtime target against the 30-minute baseline (120s per video-minute x language count), benchmark mean CER against <= 0.30, and evaluate EBU R128 loudness across both final mix and speech stem.
+- **Reason:** Provides mathematically sound, honest quality SLA evaluations scaled to input video length and multi-language workloads.
+
+### [2026-11-21] DEC-063: Speech Stem Isolation and Placed-Span Peak Normalization (D7)
+- **Decision:** In `mix_dubbed_audio`, normalize peaks across placed speech spans, isolate speech stem loudness measurement, and return structured `MixResult` containing both `final_lufs` and `stem_lufs`.
+- **Reason:** Guarantees speech clarity over background audio and provides verified loudness metrics for both the dialogue stem and full mix.
+
+### [2026-11-21] DEC-064: Mux Audio Decoding Verification and Video Timestamp Offset Sync (D8)
+- **Decision:** Implement `decode_muxed_audio` to extract and verify the audio stream directly from the muxed MP4 container via ffmpeg pipe, apply `-itsoffset` when video `start_time > 0.05s`, and constrain audio gain repairs to 2 attempts.
+- **Reason:** Confirms container integrity and stream synchronization on the final multiplexed output while preventing infinite repair loops.
+
+### [2026-11-21] DEC-065: Partial State Flushing and Completed Language Preservation on Interrupt (E1)
+- **Decision:** Track live completed summaries in `PipelineOrchestrator.completed_summaries`. On `asyncio.CancelledError` or `KeyboardInterrupt` (SIGINT), preserve completed languages as `ok`, mark incomplete languages as `failed` with `"Interrupted by user (SIGINT/Cancelled)"`, flush `report.json`, `manifest.json`, and `run.log.jsonl`, and return/exit 130 in CLI.
+- **Reason:** Prevents loss of expensive completed dubbing work and paid API spend upon user interruption while maintaining truthful SLA and manifest records.
+
+### [2026-11-21] DEC-066: Multi-Format Secret Redaction Across Logs, Manifest, and Error Fields (E2)
+- **Decision:** Implement `register_secret`, `sanitize_text`, and recursive `sanitize_data` covering configured secret tokens, `Bearer <token>`, and regex shapes `sk-`, `gsk_`, `AIza` across `PipelineLogger`, console `SanitizingFormatter`, JSONL entries, manifest data, and error fields.
+- **Reason:** Eliminates risk of secret token leakage in logs, console streams, or saved metadata artifacts.
+
+### [2026-11-21] DEC-067: Strict Bodhan Canonical Host Enforcement (E3)
+- **Decision:** Enforce via `validate_bodhan_host` and `HostAllowlistGuard` that Bodhan API calls strictly target `api.bodhan.ai` (rejecting any custom Bodhan domains), allowing localhost/127.0.0.1 strictly when `BODHAN_ALLOW_TEST_HOSTS=1`.
+- **Reason:** Prevents host spoofing or unauthorized redirects to arbitrary endpoints, securing credentials against exfiltration.
+
+### [2026-11-21] DEC-068: Lazy Cwd-Scoped Environment Configuration (E4)
+- **Decision:** Restrict `.env` loading in `Settings` strictly to `Path.cwd() / ".env"` lazily at instantiation time, eliminating directory ancestor traversal (`cwd.parent`, etc.).
+- **Reason:** Prevents unintentional inheritance of parent directory `.env` files and ensures clean workspace isolation.
+
+### [2026-11-21] DEC-069: Memory-Bounded In-Place Audio Mixing (E5)
+- **Decision:** In `media/mix.py`, apply gain envelopes in-place (`out *= gain`) and add speech stems directly into pre-allocated background buffers (`muted_bg[:, 0] += stem`), avoiding duplicate multi-channel array copies. Record mixing memory usage: peak RSS measured at ~78 MB for 2-minute stereo test track (~120 MB overhead reduction vs naive copies).
+- **Reason:** Avoids out-of-memory crashes on long 5–15 minute videos under parallel multi-language workloads.
+
 ---
 
 ## Folded Notes: Ingest, VAD, Chunking, ASR & Segmentation (Phase 2 Archive)

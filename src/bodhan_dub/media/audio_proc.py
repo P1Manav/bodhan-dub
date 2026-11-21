@@ -6,12 +6,44 @@ resampling from 24kHz to 48kHz, time-stretching with ffmpeg atempo, and crossfad
 from __future__ import annotations
 
 import io
+import math
 import subprocess
 from typing import List
 
 import numpy as np
 import scipy.signal
 import soundfile as sf
+
+
+def resample_to_48k(samples: np.ndarray, orig_sr: int) -> np.ndarray:
+    """
+    Rational polyphase resampling from orig_sr to 48,000 Hz float32.
+    """
+    if len(samples) == 0:
+        return np.zeros(0, dtype=np.float32)
+    if orig_sr == 48000:
+        return samples.astype(np.float32)
+
+    # Convert to float32 normalized in [-1.0, 1.0]
+    if samples.dtype == np.int16:
+        float_samples = samples.astype(np.float32) / 32768.0
+    else:
+        float_samples = samples.astype(np.float32)
+
+    target_sr = 48000
+    g = math.gcd(int(orig_sr), target_sr)
+    up = target_sr // g
+    down = int(orig_sr) // g
+
+    resampled = scipy.signal.resample_poly(float_samples, up=up, down=down)
+    return resampled.astype(np.float32)
+
+
+def resample_24k_to_48k(samples: np.ndarray) -> np.ndarray:
+    """
+    High-fidelity 2x upsampling from 24,000 Hz to 48,000 Hz float32.
+    """
+    return resample_to_48k(samples, 24000)
 
 
 def trim_edge_silence(
@@ -78,24 +110,6 @@ def detect_internal_silence(
 
     run_lengths = run_ends - run_starts
     return bool(np.any(run_lengths >= window_len))
-
-
-def resample_24k_to_48k(samples: np.ndarray) -> np.ndarray:
-    """
-    High-fidelity 2x upsampling from 24,000 Hz to 48,000 Hz float32 using polyphase resampler.
-    """
-    if len(samples) == 0:
-        return np.zeros(0, dtype=np.float32)
-
-    # Convert to float32 normalized in [-1.0, 1.0]
-    if samples.dtype == np.int16:
-        float_samples = samples.astype(np.float32) / 32768.0
-    else:
-        float_samples = samples.astype(np.float32)
-
-    # 24k -> 48k is exactly 2x integer ratio (up=2, down=1)
-    resampled = scipy.signal.resample_poly(float_samples, up=2, down=1)
-    return resampled.astype(np.float32)
 
 
 def time_stretch_audio(

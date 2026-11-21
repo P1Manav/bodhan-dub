@@ -168,11 +168,12 @@ def test_schedule_end_of_file_truncation_risk_flagged():
         logger=logger,
     )
 
-    # Master buffer strictly matches total duration
-    assert len(master_buffer) == int(5.0 * 48000)
-    # Flagged truncation_risk and degraded because audio extends past 5.0s even after 250ms shift
-    assert fit.qa_status == "degraded"
-    assert "truncation_risk" in fit.reasons
+    # A1: Master buffer is extended to preserve speech without truncation
+    assert len(master_buffer) >= int(5.0 * 48000)
+    # Flagged truncation_risk and degraded in scheduled segment result (no caller mutation)
+    sched_seg = sched_res.segments[0]
+    assert sched_seg.qa_status == "degraded"
+    assert "truncation_risk" in sched_seg.reasons
 
 
 def test_schedule_adjacent_tight_segments():

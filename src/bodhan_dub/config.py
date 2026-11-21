@@ -6,20 +6,16 @@ Loaded from environment variables, .env, and command-line flags.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Union
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _find_env_file() -> str:
-    """Finds .env in current directory or parent directories."""
-    cwd = Path.cwd()
-    for p in [cwd, cwd.parent, cwd.parent.parent]:
-        candidate = p / ".env"
-        if candidate.exists():
-            return str(candidate)
-    return ".env"
+def _get_cwd_env_file() -> Optional[str]:
+    """E4: Finds .env strictly in current working directory (no ancestor traversal)."""
+    candidate = Path.cwd() / ".env"
+    return str(candidate) if candidate.is_file() else None
 
 
 SILERO_VAD_PINNED_SHA256 = (
@@ -31,10 +27,15 @@ class Settings(BaseSettings):
     """Core pipeline configuration and secrets."""
 
     model_config = SettingsConfigDict(
-        env_file=_find_env_file(),
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    def __init__(self, _env_file: Optional[Union[Path, str]] = None, **values: Any):
+        # E4: Lazily resolve .env in cwd only, never searching ancestor directories
+        if _env_file is None:
+            _env_file = _get_cwd_env_file()
+        super().__init__(_env_file=_env_file, **values)
 
     # Bodhan Endpoints & Keys
     bodhan_base_url: str = Field(
@@ -97,10 +98,11 @@ class Settings(BaseSettings):
     # Circuit Breaker: consecutive 5xx failures to trigger fast fail for a language
     circuit_breaker_threshold: int = 5
 
-    # QA Thresholds (CER and degraded cutoff)
+    # QA Thresholds (CER, degraded cutoff, and script purity)
     cer_warn: float = 0.15
     cer_fail: float = 0.30
     cer_degraded_max: float = 0.45
+    max_latin_share: float = 0.30
 
     def redact_key(self, key_str: str) -> str:
         """Helper to redact sensitive credentials for safe logging."""

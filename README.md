@@ -135,7 +135,7 @@ python -m bodhan_dub --input path/to/video.mp4 --langs hi,ta,bn --estimate-only
 | `--out` | Path | `./out` | Output destination directory |
 | `--glossary` | Path | `None` | Path to custom terminology glossary YAML |
 | `--voices` | Path | `None` | Path to custom voice configuration YAML |
-| `--code-mixed` | Flag | `False` | Retain English technical vocabulary in Indic translation |
+| `--code-mixed` | Flag | `False` | Retain English technical terms in Latin script (target Indic language unchanged; raises max Latin share to 0.70) |
 | `--max-cost-inr` | Float | `None` | Budget limit in INR; pipeline stops cleanly if reached |
 | `--estimate-only` | Flag | `False` | Print cost estimate table in INR and exit |
 | `--concurrency` | Int | `2` | Maximum parallel language worker concurrency |

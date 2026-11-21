@@ -11,7 +11,7 @@ import asyncio
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 import httpx
 
@@ -58,9 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--voices",
-        type=Path,
+        type=str,
         default=None,
-        help="Path to custom voices YAML file",
+        help="Custom voices mapping: 'lang:voice' or path to YAML file",
     )
     parser.add_argument(
         "--code-mixed",
@@ -147,7 +147,20 @@ async def async_main(
     logger.info(f"Starting bodhan_dub run_id={run_id}")
     logger.info(f"Input: {args.input}, Languages: {args.langs}, Output dir: {out_dir}")
 
-    settings = Settings()
+    # B3: Wrap Settings() construction so invalid settings give exit 2, not a traceback
+    try:
+        settings = Settings()
+    except Exception as e:
+        logger.error(f"Configuration / Settings error: {e}", stage="preflight")
+        print(f"\n[ERROR] Invalid configuration or missing settings: {e}", file=sys.stderr)
+        return 2
+
+    # C2: Reject --max-cost-inr <= 0 with exit 2
+    if args.max_cost_inr is not None and args.max_cost_inr <= 0.0:
+        logger.error(f"--max-cost-inr must be > 0, got {args.max_cost_inr}", stage="preflight")
+        print(f"\n[ERROR] --max-cost-inr must be > 0, got {args.max_cost_inr}", file=sys.stderr)
+        return 2
+
     registry = LanguageRegistry()
 
     # Parse and validate target languages
@@ -161,7 +174,10 @@ async def async_main(
             settings=settings,
             registry=registry,
             estimate_only=args.estimate_only,
+            voices_arg=args.voices,
         )
+        from bodhan_dub.preflight import validate_voices_mapping
+        custom_voices = validate_voices_mapping(args.voices, registry)
     except PreflightError as e:
         logger.error(f"Preflight check failed: {e}", stage="preflight")
         print(f"\n[ERROR] Preflight check failed: {e}", file=sys.stderr)
@@ -198,21 +214,6 @@ async def async_main(
             file=sys.stderr,
         )
         return 2
-
-    # Parse optional custom voices mapping
-    custom_voices: Dict[str, str] = {}
-    if args.voices:
-        v_path = Path(args.voices)
-        if v_path.exists():
-            import yaml
-            try:
-                content = yaml.safe_load(v_path.read_text(encoding="utf-8"))
-                if isinstance(content, dict):
-                    custom_voices = {str(k).strip(): str(v).strip() for k, v in content.items()}
-            except Exception as e:
-                logger.warning(f"Failed to parse custom voices file '{v_path}': {e}", stage="cli")
-        else:
-            logger.warning(f"Custom voices file '{v_path}' not found", stage="cli")
 
     # Manifest initialization for resume tracking
     manifest_path = out_dir / "manifest.json"

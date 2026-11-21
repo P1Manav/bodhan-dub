@@ -11,7 +11,7 @@ import io
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import httpx
 import rapidfuzz
@@ -333,7 +333,23 @@ class ASRStage:
                 # B1: Always re-raise budget exhaustion and open circuit breaker
                 raise
             except httpx.HTTPStatusError as e:
-                # B1: Non-retryable HTTP errors (400, 401, 403) must be re-raised immediately
+                # B2: Documented over-length 400 triggers existing split rather than immediate abort
+                is_overlength_400 = (
+                    e.response.status_code == 400
+                    and any(w in e.response.text.lower() for w in ("duration", "length", "30", "too long", "maximum"))
+                )
+                if is_overlength_400 and depth < 2 and duration > 6.0:
+                    self.logger.warning(
+                        f"Chunk {chunk_id} over-length 400 ({e.response.text}); triggering split",
+                        stage="asr",
+                        segment_id=f"chunk_{chunk_id}",
+                    )
+                    mid = round((start_s + end_s) / 2.0, 3)
+                    left_res = await self.transcribe_chunk(audio_path, start_s, mid, chunk_id, vad_result, depth=depth + 1)
+                    right_res = await self.transcribe_chunk(audio_path, mid, end_s, chunk_id, vad_result, depth=depth + 1)
+                    return left_res + right_res
+
+                # Fatal non-retryable HTTP errors (400, 401, 403) must be re-raised immediately
                 if e.response.status_code in (400, 401, 403):
                     self.logger.error(
                         f"Fatal non-retryable HTTP {e.response.status_code} in ASR chunk {chunk_id}: {e}",
@@ -410,33 +426,98 @@ class ASRStage:
         if not chunks:
             return []
 
-        # Run chunks in parallel bounded by client semaphores
-        tasks = [
-            self.transcribe_chunk(
-                audio_path=audio_path,
-                start_s=ch.start,
-                end_s=ch.end,
-                chunk_id=ch.id,
-                vad_result=vad_result,
+        # B2: Run chunks in parallel with sibling cancellation on fatal errors
+        task_list: List[asyncio.Task] = []
+        fatal_error: Optional[BaseException] = None
+
+        def _cancel_siblings_on_fatal(t: asyncio.Task):
+            nonlocal fatal_error
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                is_fatal_http = (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code in (400, 401, 403)
+                )
+                is_fatal = is_fatal_http or isinstance(exc, (BudgetExceededError, CircuitBreakerOpen))
+                if is_fatal and fatal_error is None:
+                    fatal_error = exc
+                    for other in task_list:
+                        if not other.done():
+                            other.cancel()
+
+        for ch in chunks:
+            t = asyncio.create_task(
+                self.transcribe_chunk(
+                    audio_path=audio_path,
+                    start_s=ch.start,
+                    end_s=ch.end,
+                    chunk_id=ch.id,
+                    vad_result=vad_result,
+                )
             )
-            for ch in chunks
-        ]
-        chunk_results = await asyncio.gather(*tasks)
+            t.add_done_callback(_cancel_siblings_on_fatal)
+            task_list.append(t)
+
+        chunk_results = await asyncio.gather(*task_list, return_exceptions=True)
+
+        # Propagate fatal error after cancelling siblings
+        if fatal_error is not None:
+            raise fatal_error
 
         # Flatten and filter segments
         all_segments: List[TranscribedSegment] = []
         for seg_list in chunk_results:
+            if isinstance(seg_list, BaseException):
+                if not isinstance(seg_list, asyncio.CancelledError):
+                    raise seg_list
+                continue
             for seg in seg_list:
-                # 1. Hallucination Check: VAD speech overlap
-                overlap_ratio = calculate_speech_overlap_ratio(
-                    seg.start, seg.end, vad_result.speech_regions
-                )
-                if overlap_ratio < self.speech_overlap_min_ratio:
+                # B1: Clamp and snap API segments to VAD speech regions first
+                intersecting = [
+                    r for r in vad_result.speech_regions
+                    if r.end > seg.start and r.start < seg.end
+                ]
+                if not intersecting:
+                    # Truly no speech overlap: drop hallucinated segment
                     self.logger.warning(
-                        f"Dropping hallucinated segment '{seg.text}' (overlap {overlap_ratio:.1%} < {self.speech_overlap_min_ratio:.1%}): no_speech_overlap",
+                        f"Dropping hallucinated segment '{seg.text}' (overlap 0.0%): no_speech_overlap",
                         stage="asr",
                     )
                     continue
+
+                clamped_start = max(seg.start, intersecting[0].start)
+                clamped_end = min(seg.end, intersecting[-1].end)
+                speech_in_clamped = sum(
+                    min(clamped_end, r.end) - max(clamped_start, r.start)
+                    for r in intersecting
+                )
+
+                if speech_in_clamped <= 0.05:
+                    self.logger.warning(
+                        f"Dropping hallucinated segment '{seg.text}' (speech in clamped {speech_in_clamped:.2f}s): no_speech_overlap",
+                        stage="asr",
+                    )
+                    continue
+
+                # If coarse segment covers multiple distinct VAD speech sub-spans, split proportionally
+                if len(intersecting) > 1 and len(seg.text.split()) > 4:
+                    sub_segs = allocate_proportional_vad_segments(
+                        text=seg.text,
+                        start_s=clamped_start,
+                        end_s=clamped_end,
+                        speech_regions=intersecting,
+                    )
+                    for s in sub_segs:
+                        # Non-empty check
+                        if s.text.strip():
+                            all_segments.append(s)
+                    continue
+
+                # Snap boundaries to the clamped speech envelope
+                seg.start = round(clamped_start, 3)
+                seg.end = round(clamped_end, 3)
 
                 # 2. Hallucination Check: Looped n-grams
                 is_loop, phrase = detect_repeated_ngrams(seg.text)

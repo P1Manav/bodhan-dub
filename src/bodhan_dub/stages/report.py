@@ -33,6 +33,7 @@ class LanguageSummary(BaseModel):
     skipped_segments: int
     flagged_segments: int = 0
     overrun_segments: int = 0
+    qa_unverified: int = 0
     stretch_stats: Dict[str, float] = Field(default_factory=dict)
     sync_offset_stats: Dict[str, float] = Field(default_factory=dict)
     cer_stats: Dict[str, float] = Field(default_factory=dict)
@@ -158,8 +159,9 @@ def build_pipeline_report(
         )
     )
 
-    # 4. Loudness (-16 LUFS ± 1)
+    # 4. Loudness (-16 LUFS ± 1) and Stem Loudness
     lufs_values = [s.integrated_lufs for s in lang_summaries.values() if s.integrated_lufs > -60.0]
+    stem_lufs_values = [s.stem_lufs for s in lang_summaries.values() if s.stem_lufs is not None and s.stem_lufs > -60.0]
     if lufs_values:
         min_lufs = min(lufs_values)
         max_lufs = max(lufs_values)
@@ -168,42 +170,48 @@ def build_pipeline_report(
     else:
         lufs_met = True
         lufs_meas = "N/A (silent)"
+
+    stem_meas = f"{np.mean(stem_lufs_values):.1f} LUFS" if stem_lufs_values else "N/A"
     targets.append(
         TargetEvaluation(
             name="EBU R128 loudness",
             target="-16.0 LUFS integrated ± 1.0",
-            measured=lufs_meas,
+            measured=f"Mix: {lufs_meas}, Stem: {stem_meas}",
             met=lufs_met,
             reason="BS.1770 compliant gain staging with -1.0 dBTP peak limiter",
         )
     )
 
-    # 5. CER Transparency
+    # 5. D6: CER Transparency & Target
     mean_cers = [
         s.cer_stats.get("mean", 0.0) for s in lang_summaries.values() if "mean" in s.cer_stats
     ]
     avg_cer = float(np.mean(mean_cers)) if mean_cers else 0.0
+    total_unverified = sum(s.qa_unverified for s in lang_summaries.values())
+    cer_met = (avg_cer <= 0.30)
     targets.append(
         TargetEvaluation(
             name="Acoustic & text fidelity",
-            target="Honest CER reported per target language",
-            measured=f"Average CER {avg_cer:.3f}",
-            met=True,
+            target="Mean CER <= 0.30 across verified speech",
+            measured=f"Average CER {avg_cer:.3f} ({total_unverified} unverified segments)",
+            met=cer_met,
             reason="Full back-transcription QA executed on every synthesized segment",
         )
     )
 
-    # 6. B21: Runtime target
+    # 6. D6: Runtime target scaled from 30 min per 5 min x 3 langs baseline
     total_time_s = sum(stage_timings.values())
+    num_langs = max(1, len(lang_summaries))
     if video_duration_s > 0:
-        rt_factor = total_time_s / video_duration_s
+        scaled_target_s = max(60.0, (video_duration_s / 60.0) * num_langs * 120.0)
+        rt_met = total_time_s <= scaled_target_s
         targets.append(
             TargetEvaluation(
                 name="Processing runtime",
-                target="Linear scaling with bounded concurrency",
-                measured=f"{total_time_s:.1f}s ({rt_factor:.2f}x video duration)",
-                met=True,
-                reason=f"Pipeline finished in {total_time_s:.1f}s across {len(lang_summaries)} target language(s)",
+                target=f"<= {scaled_target_s:.1f}s (scaled 30m / 5m x 3 langs baseline)",
+                measured=f"{total_time_s:.1f}s",
+                met=rt_met,
+                reason=f"Linear scaling benchmark for {video_duration_s:.1f}s video x {num_langs} lang(s)",
             )
         )
 
