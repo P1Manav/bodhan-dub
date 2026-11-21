@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -88,8 +89,20 @@ class DiskCache:
         cost: float,
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Stores entry and metadata in cache."""
+        """
+        B16: Stores entry and metadata in cache atomically.
+        Validates payload before storing, writes to atomic temporary files,
+        and replaces targets to prevent partial or corrupted cache reads.
+        """
         if not self.enabled:
+            return
+
+        # Validate non-empty payload
+        if data is None:
+            return
+        if isinstance(data, bytes) and len(data) == 0:
+            return
+        if isinstance(data, str) and not data.strip():
             return
 
         meta = {
@@ -98,21 +111,35 @@ class DiskCache:
             "extra": extra_meta or {},
         }
 
+        pid = os.getpid()
         try:
             if isinstance(data, bytes):
                 meta["data_type"] = "binary"
-                (self.cache_dir / f"{key}.bin").write_bytes(data)
+                tmp_bin = self.cache_dir / f"{key}.bin.tmp.{pid}"
+                tmp_bin.write_bytes(data)
+                tmp_bin.replace(self.cache_dir / f"{key}.bin")
             elif isinstance(data, (dict, list)):
                 meta["data_type"] = "json"
-                (self.cache_dir / f"{key}.json").write_text(
+                tmp_json = self.cache_dir / f"{key}.json.tmp.{pid}"
+                tmp_json.write_text(
                     json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
+                tmp_json.replace(self.cache_dir / f"{key}.json")
             else:
                 meta["data_type"] = "text"
-                (self.cache_dir / f"{key}.txt").write_text(str(data), encoding="utf-8")
+                tmp_txt = self.cache_dir / f"{key}.txt.tmp.{pid}"
+                tmp_txt.write_text(str(data), encoding="utf-8")
+                tmp_txt.replace(self.cache_dir / f"{key}.txt")
 
-            (self.cache_dir / f"{key}.meta.json").write_text(
-                json.dumps(meta, indent=2), encoding="utf-8"
-            )
+            tmp_meta = self.cache_dir / f"{key}.meta.json.tmp.{pid}"
+            tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            tmp_meta.replace(self.cache_dir / f"{key}.meta.json")
         except Exception:
-            pass  # Non-fatal if cache write fails
+            # Clean up partial tmp files if any
+            for suffix in ("bin", "json", "txt", "meta.json"):
+                t = self.cache_dir / f"{key}.{suffix}.tmp.{pid}"
+                if t.exists():
+                    try:
+                        t.unlink(missing_ok=True)
+                    except Exception:
+                        pass

@@ -58,6 +58,10 @@ manifest.json
 *.srt
 *.vtt
 
+# Scratch & Demo directories (NEVER commit media or scratch data)
+scratch/
+do not push to github demo folder/
+
 # IDE & OS
 .vscode/
 .idea/

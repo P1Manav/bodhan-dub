@@ -56,6 +56,25 @@ def check_tool_installed(tool_name: str) -> str:
     return path
 
 
+def check_disk_space(target_path: Path, min_free_mb: float = 500.0) -> None:
+    """B20: Verifies sufficient free disk space in the target directory."""
+    check_dir = target_path if target_path.is_dir() else target_path.parent
+    if not check_dir.exists():
+        check_dir = check_dir.parent
+    try:
+        usage = shutil.disk_usage(str(check_dir))
+        free_mb = usage.free / (1024 * 1024)
+        if free_mb < min_free_mb:
+            raise PreflightError(
+                f"Insufficient disk space in '{check_dir}': {free_mb:.1f} MB available, "
+                f"requires at least {min_free_mb:.1f} MB free."
+            )
+    except PreflightError:
+        raise
+    except Exception:
+        pass
+
+
 def probe_media_file(input_path: Path) -> MediaInfo:
     """Runs ffprobe on the input file and extracts audio/video stream details."""
     if not input_path.exists():
@@ -212,6 +231,11 @@ def run_preflight_checks(
     check_tool_installed("ffmpeg")
     check_tool_installed("ffprobe")
 
+    # B20: Disk space check (min 500 MB or 3x input video size)
+    input_size_mb = (input_path.stat().st_size / (1024 * 1024)) if input_path.exists() else 0.0
+    required_space_mb = max(500.0, input_size_mb * 3.0)
+    check_disk_space(input_path, min_free_mb=required_space_mb)
+
     # 2. Input media probe
     media_info = probe_media_file(input_path)
     validate_duration(media_info.duration)
@@ -234,6 +258,10 @@ def run_preflight_checks(
                 f"Missing required Bodhan API keys in environment: {', '.join(missing_keys)}. "
                 "Please configure them in your .env file or environment variables."
             )
+
+        # B20: LLM configuration check
+        if settings.llm_api_key and not settings.llm_base_url:
+            raise PreflightError("LLM_API_KEY is configured but LLM_BASE_URL is missing or invalid.")
 
     # 5. Cost estimate
     estimates = estimate_pipeline_cost(media_info.duration, len(valid_langs), settings)

@@ -52,7 +52,10 @@ def detect_internal_silence(
     min_silence_s: float = 1.5,
     threshold_db: float = -45.0,
 ) -> bool:
-    """Detects if there is an unnatural pause longer than min_silence_s inside speech."""
+    """
+    B8: Vectorized unnatural pause detection using numpy without Python sample loops.
+    Detects if there is a silent pause longer than min_silence_s inside speech.
+    """
     if len(samples) == 0:
         return False
 
@@ -62,18 +65,19 @@ def detect_internal_silence(
     if len(samples) < window_len:
         return False
 
-    is_silent = np.abs(samples) < threshold_amp
-    # Check if any contiguous run of length window_len is all silent
-    silent_runs = 0
-    for val in is_silent:
-        if val:
-            silent_runs += 1
-            if silent_runs >= window_len:
-                return True
-        else:
-            silent_runs = 0
+    is_silent = (np.abs(samples) < threshold_amp).astype(np.int32)
 
-    return False
+    # Use run-length encoding via diff on zero-padded boundaries
+    padded = np.pad(is_silent, (1, 1), mode="constant", constant_values=0)
+    diffs = np.diff(padded)
+    run_starts = np.where(diffs == 1)[0]
+    run_ends = np.where(diffs == -1)[0]
+
+    if len(run_starts) == 0:
+        return False
+
+    run_lengths = run_ends - run_starts
+    return bool(np.any(run_lengths >= window_len))
 
 
 def resample_24k_to_48k(samples: np.ndarray) -> np.ndarray:
@@ -132,38 +136,48 @@ def time_stretch_audio(
     return stretched
 
 
+async def async_time_stretch_audio(
+    samples: np.ndarray,
+    speed: float,
+    sample_rate: int = 48000,
+) -> np.ndarray:
+    """B8: Offloads atempo time stretching to a background thread."""
+    import asyncio
+    return await asyncio.to_thread(time_stretch_audio, samples, speed, sample_rate)
+
+
 def crossfade_concat(
     segments: List[np.ndarray],
     crossfade_ms: int = 10,
     sample_rate: int = 24000,
 ) -> np.ndarray:
     """
-    Concatenates audio arrays with short linear crossfades at boundaries to eliminate clicks.
+    B8: Vectorized concatenation of audio arrays with short linear crossfades
+    using pure numpy operations instead of Python list concatenation.
     """
-    if not segments:
+    valid = [s.astype(np.float32) for s in segments if len(s) > 0]
+    if not valid:
         return np.zeros(0, dtype=np.float32)
-    if len(segments) == 1:
-        return segments[0]
+    if len(valid) == 1:
+        return valid[0]
 
     xfade_samples = int((crossfade_ms / 1000.0) * sample_rate)
-    result = list(segments[0])
+    fade_out = np.linspace(1.0, 0.0, xfade_samples, dtype=np.float32)
+    fade_in = np.linspace(0.0, 1.0, xfade_samples, dtype=np.float32)
 
-    for nxt in segments[1:]:
-        if len(nxt) == 0:
-            continue
+    result = valid[0]
+
+    for nxt in valid[1:]:
         if len(result) < xfade_samples or len(nxt) < xfade_samples:
-            result.extend(nxt)
+            result = np.concatenate([result, nxt])
             continue
 
-        # Linear crossfade over xfade_samples
-        overlap_a = np.array(result[-xfade_samples:], dtype=np.float32)
-        overlap_b = nxt[:xfade_samples].astype(np.float32)
-
-        fade_out = np.linspace(1.0, 0.0, xfade_samples, dtype=np.float32)
-        fade_in = np.linspace(0.0, 1.0, xfade_samples, dtype=np.float32)
-
+        # Overlap crossfade
+        overlap_a = result[-xfade_samples:]
+        overlap_b = nxt[:xfade_samples]
         crossfaded = (overlap_a * fade_out) + (overlap_b * fade_in)
-        # Replace tail of result with crossfaded samples, then append remainder of nxt
-        result = result[:-xfade_samples] + list(crossfaded) + list(nxt[xfade_samples:])
 
-    return np.array(result, dtype=np.float32)
+        # Concatenate: result prefix + crossfade region + next suffix
+        result = np.concatenate([result[:-xfade_samples], crossfaded, nxt[xfade_samples:]])
+
+    return result.astype(np.float32)

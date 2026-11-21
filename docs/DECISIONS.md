@@ -108,6 +108,66 @@ This log records design decisions made during development of `bodhan_dub`, follo
 - **Decision:** When `--speaker-voices auto` is set, estimate fundamental frequency (F0) per speech segment via autocorrelation; cluster segments into male/female (or 2 clusters), and map clusters to male and female voices from `LanguageRegistry.get_default_voice`. Fallback to default voice if clustering fails or single speaker.
 - **Reason:** Supports multi-speaker videos with automatic vocal identity preservation without requiring external speaker diarization models.
 
+### [2026-11-21] DEC-027: Reusable Dubbing Analyzer and Empirical Baseline Protocol
+- **Decision:** Implement `scripts/analyze_dub.py` using strictly non-ML signal processing tools (`ffmpeg`, `ffprobe`, `numpy`, `pyloudnorm`) without any non-Bodhan ASR. Evaluates: (1) container format and stream duration deltas (pass $\le 100\text{ ms}$); (2) EBU R128 integrated LUFS and 4x true peak; (3) 100ms energy VAD onset alignment, p95/max offset, and ghost speech quantification; (4) sliding 1s waveform correlation cross-referenced with `segments.<lang>.json` skipped slots; (5) long silence (>3s) narration drop detection; (6) report.json honesty verification. Store baseline empirical findings in `docs/VIDEO_ANALYSIS.md`.
+- **Reason:** Provides an objective, reproducible, model-free regression measurement harness to detect timing drift, loudness discrepancies, dropped narration, and mute leakage.
+
+### [2026-11-21] DEC-028: Lookahead True-Peak Limiter and Multi-Stage Loudness Iteration (B3)
+- **Decision:** Implement lookahead true-peak limiting in `media/loudness.py` with 4x polyphase oversampled peak detection, 5ms lookahead delay, 5ms attack / 50ms release envelope follower, and hard ceiling at -1.0 dBTP. Replace single-pass gain reduction with multi-stage loudness pipeline: normalize segments -> normalize speech stem to -16 LUFS -> mix with background ducking -> apply true-peak limiter -> measure final mix and iterate gain up to 3 times to guarantee both -16 ± 1 LUFS and $\le -1.0\text{ dBTP}$. Enforce loudness and audio-stream presence checks in `media/mux.py::mux_and_verify`.
+- **Reason:** Direct gain cuts previously deformed audio loudness after normalization, failing EBU R128 targets. Lookahead envelope limiting preserves audio dynamics while strictly preventing digital inter-sample clipping.
+
+### [2026-11-21] DEC-029: Single-Stretch from Raw Synthesis and Non-Cascading Drift Budget (B6 & B13)
+- **Decision:** Store raw unstretched synthesis audio on `SegmentFitResult` and ensure `TimelineScheduler` always re-stretches from the raw synthesized audio rather than re-stretching previously stretched buffers. Hard-cap cumulative speed factor at 1.20x max. In `TimelineScheduler`, enforce non-cascading drift: each segment anchors to its source start within a strict $\pm 300\text{ ms}$ window and does not push subsequent segments into the future if an earlier segment overruns. Overlaps are resolved via preceding slack borrowing, 1.20x stretch, following slack borrowing, and $\le 100\text{ ms}$ crossfade with `overlap_forced` flag.
+- **Reason:** Cascading offsets previously caused 11.4s of acoustic drift across the video. Non-cascading scheduling with single-pass stretch preserves voice naturalness and guarantees tight alignment.
+
+### [2026-11-21] DEC-030: Mute Mask Union of Source Speech and Placed Audio with Holes for Skipped Slots (B11)
+- **Decision:** In `media/mix.py`, compute the mute mask as the mathematical union of all detected source speech regions and all placed dubbed segment spans, applied with 40ms equal-power cosine crossfades. Punch explicit holes in the mute mask for skipped segments (`[start, end]`) so original English audio remains audible only for intentionally skipped slots. Clamp placed dubbed spans to $[start - 300\text{ms}, end + 300\text{ms}]$ to eliminate ghost speech.
+- **Reason:** Eliminates the 14s of original English audio leakage found during baseline analysis and prevents dubbed speech from playing in empty silence.
+
+### [2026-11-21] DEC-031: Event Loop Offloading and Vectorized Signal Processing (B8)
+- **Decision:** Wrap all blocking CPU/IO operations (atempo time stretching, ffmpeg silence detection, crossfading, Demucs separation, and disk reads/writes $>100\text{ KB}$) in `asyncio.to_thread`. Vectorize `detect_internal_silence` and `crossfade_concat` in `media/audio_proc.py` using NumPy vectorized operations and run-length encoding instead of Python sample loops.
+- **Reason:** Prevents event loop blocking during multi-language processing, ensuring concurrent language pipelines run smoothly without jitter.
+
+### [2026-11-21] DEC-032: Warm-Up Calibration and Post-Synthesis Condensation (B7)
+- **Decision:** Warm up `CPSCalibrator` by sequentially synthesizing the first $N=3$ segments of a language before predicting duration for remaining segments. In `stages/fit.py`, if synthesized audio exceeds the available slot by $> 1.20\text{x}$ even with slack borrowing, execute up to two post-synthesis English condensation loops via the LLM, re-translate, and re-synthesize before falling back to stretch $\le 1.20\text{x}$ and flagging `overrun`. Remove dead duplicate blocks in candidate selection.
+- **Reason:** Eliminates cold-start prediction errors on unseen voice profiles and drastically reduces overrun rates on verbose translations while strictly respecting the 1.20x stretch ceiling.
+
+### [2026-11-21] DEC-033: Grapheme-Aware Punctuation Splitting and Safe Chunk Limits (B10)
+- **Decision:** Enhance `split_text_at_punctuation` in `stages/tts.py` to protect decimal numbers (`3.14`), abbreviation dots, and numbers with commas from being split. If punctuation-split chunks still exceed `max_chars` (safe limit from language configuration, default 180), fall back to whitespace splitting, and if a single word exceeds `max_chars`, split cleanly at Unicode grapheme cluster boundaries (`\X`). Remove all `except TypeError` retry blocks.
+- **Reason:** Prevents malformed audio chunks and numbers from being severed into gibberish while eliminating fragile exception swallowing.
+
+### [2026-11-21] DEC-034: Reference-Relative Speech QA and Resilient Back-Transcription (B14)
+- **Decision:** Include duration mismatch (ratio outside $[0.65, 1.35]$), digital clipping, and internal pause ($>1.5\text{s}$) directly in the QA `passed` boolean determination. Compare detected n-gram repetitions against the reference Indic text: if the repeated pattern exists in the reference text (e.g. natural Indic reduplication such as "बार-बार" or "छोटे-छोटे"), do not flag it as an error. If back-transcription fails due to transient 5xx or API errors, mark the segment as `degraded`/`unverified` (CER 0.0) without burning TTS retry attempts or crashing the pipeline.
+- **Reason:** Avoids false positives on valid linguistic reduplication and prevents backend ASR outages from consuming synthesis retries.
+
+### [2026-11-21] DEC-035: Four-Step Translation Ladder and Configurable Latin Character Tolerance (B17)
+- **Decision:** Implement a structured 4-step translation ladder: (1) entity placeholders; (2) raw un-placeholdered translation; (3) English paraphrase re-translation; (4) accept last valid Indic candidate with `translation_flagged` (or `translation_failed` with empty target text if no Indic text exists). Allow Latin character share up to 45% to accommodate technical acronyms (e.g. "AI", "NASA") while rejecting pure English. Use dynamic length-ratio bounds based on source sentence length, and wrap parallel translation in `return_exceptions=True` to retain partial results on budget stops.
+- **Reason:** Replaces ad-hoc retry logic with a deterministic ladder, avoids rejecting sentences with legitimate technical loanwords, and guarantees partial state retention.
+
+### [2026-11-21] DEC-036: Cross-Platform Process Interruption and Exit Code Contracts (B9, B20)
+- **Decision:** Handle SIGINT and SIGTERM across POSIX (via loop signal handlers) and Windows (via `signal.signal`), triggering task cancellation, flushing manifest, partial report, and run log before exiting with code 130. Enforce strict exit code contracts: 0 = success, 1 = failure, 2 = preflight/usage error, 130 = interrupt.
+- **Reason:** Guarantees no orphaned tasks or lost state on Ctrl-C and adheres to UNIX exit code standards.
+
+### [2026-11-21] DEC-037: Audio Stream Padding, Codec Compatibility, and Stream Selection in Multiplexing (B12)
+- **Decision:** When source audio is shorter than the video container (e.g. the 2s gap in `English.mp4`), pad original audio to exact video duration in `media/extract.py`. In `media/mux.py`, probe video codec and container format, falling back to H.264 CRF 18 re-encoding if stream copy fails. Use explicit stream mapping `-map 0:v:0 -map 1:a:0` and clean up temporary repair WAVs upon verification.
+- **Reason:** Resolves audio/video duration mismatch at the end of output videos and handles arbitrary container formats safely.
+
+### [2026-11-21] DEC-038: Cryptographic Content-Addressed Resume and Checkpoint Integrity (B15)
+- **Decision:** In `manifest.py` and `orchestrator.py`, key segment checkpoints by the cryptographic hash `sha256(source_text + translation + voice + language)`. Store and restore complete measured metrics (`res.model_dump`) beside cached WAVs, ensuring resume doesn't alter reported statistics or accept stale audio.
+- **Reason:** Prevents stale checkpoints from contaminating runs if source text, translation, or voice settings change between runs.
+
+### [2026-11-21] DEC-039: Atomic Cache Writes and Payload Validation (B16)
+- **Decision:** In `gateway/cache.py`, validate that cached data is non-empty before writing. Use atomic temporary file writes (`.tmp.<pid>`) and atomic replacement (`os.replace`) to prevent corrupted cache reads across concurrent workers.
+- **Reason:** Eliminates race conditions and corrupted disk cache entries under multi-language concurrency.
+
+### [2026-11-21] DEC-040: Pre-Call Budget Reservation and HTTP-Date Retry-After Handling (B18)
+- **Decision:** In `gateway/cost.py`, implement `BudgetGuard.reserve` to hold estimated cost before initiating paid API calls and reconcile after completion. In `gateway/resilience.py`, parse `Retry-After` headers supporting both integer seconds and RFC 2822 HTTP-date strings, and record network timeouts toward circuit breaker failure counts (504 Gateway Timeout).
+- **Reason:** Prevents concurrent tasks from overshooting the configured budget ceiling and ensures standards-compliant rate limit handling.
+
+### [2026-11-21] DEC-041: Preflight Disk Space, Duration Clamping, and Full Metric Reporting (B20, B21)
+- **Decision:** In `preflight.py`, verify available disk space ($\ge 500\text{ MB}$ or $3\times$ video size) and validate LLM settings upfront. In `stages/report.py`, include runtime target, speech stem LUFS, final mix LUFS, and true peak dBTP in `report.json`. Update `README.md` to clarify the 13 production languages (1 source + 12 targets).
+- **Reason:** Fails fast before spending resources on full disks or misconfigured environments, and provides complete audio engineering transparency in reports.
+
 ---
 
 ## Folded Notes: Ingest, VAD, Chunking, ASR & Segmentation (Phase 2 Archive)

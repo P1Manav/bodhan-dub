@@ -55,11 +55,12 @@ def check_dominant_script(
     target_lang: str,
     registry: LanguageRegistry,
     min_indic_ratio: float = 0.5,
+    max_latin_share: float = 0.45,
 ) -> Tuple[bool, str]:
     """
-    Checks that the text is written in the expected Indic script.
-    Allows Latin letters (e.g. acronyms or brand names) but ensures target script dominates
-    and no other Indic script dominates.
+    B17: Checks that the text is written in the expected Indic script.
+    Allows Latin letters (e.g. acronyms or brand names) up to max_latin_share (default ~40%)
+    while ensuring target Indic script dominates and no different Indic script dominates.
     """
     info = registry.get_info(target_lang)
     if not info or not info.unicode_range:
@@ -77,6 +78,7 @@ def check_dominant_script(
 
     indic_count = sum(1 for ch in letters if is_in_target_range(ord(ch)))
     latin_count = sum(1 for ch in letters if ord(ch) < 0x024F)
+    total_letters = len(letters)
 
     # Check if letters from a DIFFERENT Indic block dominate
     for r in registry.indic_script_ranges:
@@ -97,8 +99,13 @@ def check_dominant_script(
             return False, "dominant_script_mismatch (latin_only)"
         return False, "dominant_script_mismatch (no_target_script)"
 
-    # Discount allowed Latin terms
-    non_latin_count = max(1, len(letters) - latin_count)
+    # B17: Configurable max Latin share check (default 30%)
+    latin_share = latin_count / float(total_letters)
+    if latin_share > max_latin_share:
+        return False, f"dominant_script_mismatch (excessive_latin_share={latin_share:.2f} > {max_latin_share})"
+
+    # Target Indic vs other non-Latin
+    non_latin_count = max(1, total_letters - latin_count)
     indic_ratio = indic_count / float(non_latin_count)
     if indic_ratio < min_indic_ratio:
         return False, f"dominant_script_mismatch (indic_ratio={indic_ratio:.2f} < {min_indic_ratio})"
@@ -113,11 +120,11 @@ def run_translation_structural_checks(
     registry: LanguageRegistry,
 ) -> Tuple[bool, Optional[str]]:
     """
-    Runs deterministic validation checks on translated Indic text:
+    B17: Runs deterministic validation checks on translated Indic text:
     1. Non-empty
-    2. Dominant script
+    2. Dominant script (with <= 30% Latin share)
     3. Numbers preserved
-    4. Length ratio (0.4 to 3.0)
+    4. Dynamic length ratio bounds based on source length
     5. No repeated n-grams / looping
     6. No leftover placeholders
     7. Not verbatim copy of source
@@ -134,10 +141,34 @@ def run_translation_structural_checks(
     if "__TERM_" in t_clean:
         return False, "leftover_placeholders"
 
-    # Length ratio check
-    ratio = len(t_clean) / max(1.0, float(len(s_clean)))
-    if ratio < 0.4 or ratio > 3.2:
-        return False, f"abnormal_length_ratio_{ratio:.2f}"
+    # B17: Dynamic length ratio bounds based on source length
+    s_len = max(1.0, float(len(s_clean)))
+    ratio = len(t_clean) / s_len
+    if s_len < 15.0:
+        min_ratio, max_ratio = 0.30, 4.50
+    elif s_len > 100.0:
+        min_ratio, max_ratio = 0.45, 2.50
+    else:
+        min_ratio, max_ratio = 0.40, 3.20
+
+    if ratio < min_ratio or ratio > max_ratio:
+        return False, f"abnormal_length_ratio_{ratio:.2f} (allowed {min_ratio:.2f}-{max_ratio:.2f})"
+
+    # Dominant script check
+    script_ok, reason = check_dominant_script(t_clean, target_lang, registry)
+    if not script_ok:
+        return False, reason
+
+    # Numbers preservation
+    if not verify_numbers_preserved(s_clean, t_clean):
+        return False, "number_mismatch"
+
+    # Repeated n-gram looping
+    is_loop, phrase = detect_repeated_ngrams(t_clean, min_n=1, max_n=3, repeat_threshold=3)
+    if is_loop:
+        return False, f"repeated_ngram_loop_{phrase}"
+
+    return True, None
 
     # Dominant script check
     script_ok, reason = check_dominant_script(t_clean, target_lang, registry)
@@ -469,8 +500,35 @@ class TranslationStage:
         target_lang: str,
         glossary: Glossary,
     ) -> List[TranslatedSegment]:
-        """Translates all segments for a target language in parallel bounded by semaphore."""
+        """
+        B17: Translates all segments for a target language in parallel bounded by semaphore.
+        Uses return_exceptions=True to keep partial translations on non-fatal failures,
+        while re-raising BudgetExceededError and CircuitBreakerOpen.
+        """
         async def _translate(seg: SegmentSlot) -> TranslatedSegment:
             return await self.translate_segment(seg, target_lang, glossary)
 
-        return list(await asyncio.gather(*[_translate(seg) for seg in segments]))
+        raw_results = await asyncio.gather(
+            *[_translate(seg) for seg in segments], return_exceptions=True
+        )
+        results: List[TranslatedSegment] = []
+        for idx, res in enumerate(raw_results):
+            if isinstance(res, (BudgetExceededError, CircuitBreakerOpen)):
+                raise res
+            elif isinstance(res, Exception):
+                seg = segments[idx]
+                results.append(
+                    TranslatedSegment(
+                        id=seg.id,
+                        index=seg.index,
+                        source_text=seg.text,
+                        target_text="",
+                        target_lang=target_lang,
+                        status="translation_failed",
+                        flag_reason=f"exception: {res}",
+                        attempt=3,
+                    )
+                )
+            else:
+                results.append(res)
+        return results

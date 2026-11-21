@@ -6,10 +6,10 @@ slack borrowing, and pitch-preserving time stretching (atempo).
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from bodhan_dub.gateway.bodhan import BodhanClient
 from bodhan_dub.gateway.cost import BudgetExceededError
@@ -40,6 +40,8 @@ class ParaphrasedEnglish(BaseModel):
 
 
 class SegmentFitResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     segment_id: str
     source_en: str
     final_en: str
@@ -54,6 +56,7 @@ class SegmentFitResult(BaseModel):
     fit_status: str  # ok, stretched, borrowed_slack, overrun, skipped
     attempts: int
     reasons: List[str] = Field(default_factory=list)
+    raw_audio: Optional[Any] = Field(default=None, exclude=True)
 
 
 class SegmentFitController:
@@ -312,21 +315,13 @@ class SegmentFitController:
                         synth_kwargs["nonce"] = last_nonce
                     if current_max_chars != 180:
                         synth_kwargs["max_chars"] = current_max_chars
-                    try:
-                        audio_48k, actual_dur, p_dur = await self.synthesizer.synthesize(
-                            text=current_tr,
-                            lang=lang,
-                            voice=voice,
-                            segment_id=f"{segment_id}_a{attempts}",
-                            **synth_kwargs,
-                        )
-                    except TypeError:
-                        audio_48k, actual_dur, p_dur = await self.synthesizer.synthesize(
-                            text=current_tr,
-                            lang=lang,
-                            voice=voice,
-                            segment_id=f"{segment_id}_a{attempts}",
-                        )
+                    audio_48k, actual_dur, p_dur = await self.synthesizer.synthesize(
+                        text=current_tr,
+                        lang=lang,
+                        voice=voice,
+                        segment_id=f"{segment_id}_a{attempts}",
+                        **synth_kwargs,
+                    )
                 else:
                     audio_48k = np.array([], dtype=np.float32)
                     actual_dur = 0.0
@@ -479,18 +474,6 @@ class SegmentFitController:
                     qa_status = "skipped"
             else:
                 qa_status = "skipped"
-            # Sort remaining candidates by lowest CER
-            valid_cands = [c for c in candidates if len(c.audio_48k) > 0 and not c.metrics.is_empty]
-            if valid_cands:
-                valid_cands.sort(key=lambda c: c.metrics.cer)
-                best = valid_cands[0]
-                if best.metrics.cer < 0.45 and not best.metrics.is_silent:
-                    chosen_candidate = best
-                    qa_status = "degraded"
-                else:
-                    qa_status = "skipped"
-            else:
-                qa_status = "skipped"
 
         # If candidate is unusable / skipped, original audio is kept for this slot
         if chosen_candidate is None or qa_status == "skipped":
@@ -522,6 +505,55 @@ class SegmentFitController:
         # 4. Duration Fit Strategy (Diagram 3: P, Q, R, S, T)
         audio = chosen_candidate.audio_48k
         raw_dur = len(audio) / 48000.0
+        borrow_before = min(0.250, max(0.0, slack_before))
+        borrow_after = max(0.0, slack_after)
+        effective_slot = slot_duration + borrow_before + borrow_after
+
+        # B7: Post-synthesis condensation loop if audio exceeds available slot by > 1.20x
+        condense_passes = 0
+        while raw_dur > (effective_slot * 1.20) and condense_passes < 2:
+            condense_passes += 1
+            target_budget = max(15, int(len(current_en) * ((effective_slot * 1.15) / raw_dur)))
+            condensed = await self._condense_english_source(
+                current_en, target_budget, lang, segment_id, terms_to_protect
+            )
+            if not condensed or not self.bodhan_client or not self.synthesizer:
+                break
+            try:
+                # Re-translate condensed English
+                re_tr, _ = await self.bodhan_client.translate(
+                    text=condensed,
+                    target_language_code=target_code,
+                    source_language_code="en",
+                    stage="re_translate_fit_condense",
+                    lang=lang,
+                    segment_id=segment_id,
+                )
+                if re_tr and re_tr.strip():
+                    if not self.registry or check_dominant_script(re_tr, lang, self.registry)[0]:
+                        # Re-synthesize
+                        re_audio, re_dur, _ = await self.synthesizer.synthesize(
+                            text=re_tr.strip(),
+                            lang=lang,
+                            voice=voice,
+                            segment_id=f"{segment_id}_condense{condense_passes}",
+                        )
+                        if len(re_audio) > 0:
+                            current_en = condensed
+                            current_tr = re_tr.strip()
+                            audio = re_audio
+                            raw_dur = re_dur
+            except (BudgetExceededError, CircuitBreakerOpen):
+                raise
+            except Exception as e:
+                self.logger.warning(
+                    f"Post-synthesis condensation pass {condense_passes} failed: {e}",
+                    stage="fit",
+                    lang=lang,
+                    segment_id=segment_id,
+                )
+                break
+
         fit_ratio = raw_dur / max(0.1, slot_duration)
 
         if fit_ratio <= 1.0:
@@ -540,9 +572,6 @@ class SegmentFitController:
             fit_status = "stretched"
         else:
             # fit_ratio > 1.20: borrow slack, stretch to max 1.20, flag overrun if still over
-            borrow_before = min(0.250, max(0.0, slack_before))
-            borrow_after = max(0.0, slack_after)
-            effective_slot = slot_duration + borrow_before + borrow_after
             eff_ratio = raw_dur / max(0.1, effective_slot)
 
             if eff_ratio <= 1.20:
@@ -567,7 +596,7 @@ class SegmentFitController:
             segment_id=segment_id,
             source_en=source_en,
             final_en=current_en,
-            final_translation=chosen_candidate.text,
+            final_translation=current_tr,
             raw_duration=round(raw_dur, 3),
             final_duration=round(final_dur, 3),
             slot_duration=round(slot_duration, 3),
@@ -578,6 +607,7 @@ class SegmentFitController:
             fit_status=fit_status,
             attempts=attempts,
             reasons=chosen_candidate.metrics.failure_reasons,
+            raw_audio=audio.copy(),
         )
 
         return result, final_audio

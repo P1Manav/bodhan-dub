@@ -134,24 +134,50 @@ class CostLedger:
 
 
 class BudgetGuard:
-    """Pre-call budget gate preventing spend beyond max_cost_inr."""
+    """Pre-call budget gate preventing spend beyond max_cost_inr with reservation support."""
 
     def __init__(self, ledger: CostLedger, max_cost_inr: Optional[float] = None):
         self.ledger = ledger
         self.max_cost_inr = max_cost_inr
+        self.reserved_inr: float = 0.0
+        self._lock = asyncio.Lock()
 
     def set_budget(self, max_cost_inr: Optional[float]) -> None:
         self.max_cost_inr = max_cost_inr
 
     async def check_budget(self, estimated_next_cost: float = 0.0) -> None:
-        """Raises BudgetExceededError if current spend + estimated next call exceeds budget."""
+        """Raises BudgetExceededError if current spend + reserved + estimated next call exceeds budget."""
         if self.max_cost_inr is None or self.max_cost_inr <= 0.0:
             return
 
         current_total = await self.ledger.get_total_inr()
-        if current_total + estimated_next_cost > self.max_cost_inr:
-            raise BudgetExceededError(
-                f"Budget limit exceeded! Current spend: ₹{current_total:.2f}, "
-                f"Attempted call estimate: ₹{estimated_next_cost:.2f}, "
-                f"Budget ceiling: ₹{self.max_cost_inr:.2f}."
-            )
+        async with self._lock:
+            effective_total = current_total + self.reserved_inr + estimated_next_cost
+            if effective_total > self.max_cost_inr:
+                raise BudgetExceededError(
+                    f"Budget limit exceeded! Current spend: ₹{current_total:.2f}, "
+                    f"Reserved: ₹{self.reserved_inr:.2f}, "
+                    f"Attempted call estimate: ₹{estimated_next_cost:.2f}, "
+                    f"Budget ceiling: ₹{self.max_cost_inr:.2f}."
+                )
+
+    def reserve(self, estimated_cost: float):
+        """B18: Context manager reserving estimated cost before call and reconciling after."""
+        class _ReservationContext:
+            def __init__(self, guard: BudgetGuard, amount: float):
+                self.guard = guard
+                self.amount = amount
+
+            async def __aenter__(self):
+                if self.guard.max_cost_inr is not None and self.guard.max_cost_inr > 0.0:
+                    await self.guard.check_budget(self.amount)
+                    async with self.guard._lock:
+                        self.guard.reserved_inr += self.amount
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                if self.guard.max_cost_inr is not None and self.guard.max_cost_inr > 0.0:
+                    async with self.guard._lock:
+                        self.guard.reserved_inr = max(0.0, self.guard.reserved_inr - self.amount)
+
+        return _ReservationContext(self, estimated_cost)

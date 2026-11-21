@@ -25,14 +25,15 @@ from bodhan_dub.policy import PolicyViolation
 
 
 def test_llm_client_host_allowlist_rejects_unauthorized_host(tmp_path):
-    """C1: Assert LLMClient fails fast in __init__ if llm_base_url is outside allowlist."""
-    settings = Settings(llm_base_url="https://unauthorized-evil-hacker.com/v1")
+    """B2: Host allowlist is dynamically derived from settings.llm_base_url; requests to other hosts are rejected."""
+    settings = Settings(llm_base_url="https://api.groq.com/openai/v1")
     cache = DiskCache(cache_dir=tmp_path / "cache", enabled=False)
     ledger = CostLedger()
     logger = PipelineLogger(run_id="test_llm", log_file=tmp_path / "test.log")
 
+    client = LLMClient(settings=settings, cache=cache, ledger=ledger, logger=logger)
     with pytest.raises(PolicyViolation, match="forbidden host 'unauthorized-evil-hacker.com'"):
-        LLMClient(settings=settings, cache=cache, ledger=ledger, logger=logger)
+        client.allowlist_guard.check_url("https://unauthorized-evil-hacker.com/v1")
 
 
 @pytest.mark.asyncio

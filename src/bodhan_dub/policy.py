@@ -7,7 +7,8 @@ Policy Guard: Structural enforcement of platform constraints.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+import os
+from typing import List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 # Unicode ranges for Indic and Arabic-derived scripts
@@ -90,12 +91,15 @@ guard_llm_output_english_only = validate_llm_text
 class HostAllowlistGuard:
     """HTTP client event hook enforcing that requests only target allowlisted hosts."""
 
-    def __init__(self, allowed_hosts: List[str]):
-        self.allowed_hosts = set(h.lower() for h in allowed_hosts)
-        # Always allow test / local hosts
-        self.allowed_hosts.add("localhost")
-        self.allowed_hosts.add("127.0.0.1")
-        self.allowed_hosts.add("testserver")
+    def __init__(self, allowed_hosts: List[str], allow_test_hosts: Optional[bool] = None):
+        self.allowed_hosts: Set[str] = set(h.lower() for h in allowed_hosts if h)
+        # B19: HostAllowlistGuard allows localhost/127.0.0.1/testserver only under a test flag
+        if allow_test_hosts is None:
+            allow_test_hosts = os.getenv("BODHAN_ALLOW_TEST_HOSTS", "0") in ("1", "true", "True")
+        if allow_test_hosts:
+            self.allowed_hosts.add("localhost")
+            self.allowed_hosts.add("127.0.0.1")
+            self.allowed_hosts.add("testserver")
 
     def check_url(self, url: str) -> None:
         parsed = urlparse(str(url))

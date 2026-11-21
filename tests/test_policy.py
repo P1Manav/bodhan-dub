@@ -61,7 +61,7 @@ def test_validate_llm_text_guard():
 
 def test_host_allowlist_enforcement():
     """Verify HostAllowlistGuard blocks unauthorized network endpoints."""
-    guard = HostAllowlistGuard(["api.bodhan.ai", "api.openai.com"])
+    guard = HostAllowlistGuard(["api.bodhan.ai", "api.openai.com"], allow_test_hosts=True)
 
     # Allowed hosts
     guard.check_url("https://api.bodhan.ai/v1/audio/speech")
@@ -75,6 +75,11 @@ def test_host_allowlist_enforcement():
 
     with pytest.raises(PolicyViolation, match="forbidden host 'translate.google.com'"):
         guard.check_url("https://translate.google.com/api")
+
+    # B19: In production mode (allow_test_hosts=False), localhost is blocked
+    prod_guard = HostAllowlistGuard(["api.bodhan.ai", "api.openai.com"], allow_test_hosts=False)
+    with pytest.raises(PolicyViolation, match="forbidden host 'localhost'"):
+        prod_guard.check_url("http://localhost:8000/test")
 
 
 @pytest.mark.asyncio

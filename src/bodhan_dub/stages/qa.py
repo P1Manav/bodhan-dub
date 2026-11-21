@@ -104,11 +104,13 @@ class SpeechQA:
             reasons.append("internal_silence")
 
         dur_ratio = actual_dur / max(0.1, predicted_duration)
-        if dur_ratio < 0.6 or dur_ratio > 1.6:
+        is_duration_mismatch = (dur_ratio < 0.65 or dur_ratio > 1.35)
+        if is_duration_mismatch:
             reasons.append(f"duration_mismatch_ratio_{dur_ratio:.2f}")
 
         # Back-transcription with Indic-Transcribe
         wav_16k_bytes = convert_48k_to_16k_wav_bytes(audio_48k)
+        back_transcription_failed = False
         try:
             resp = await self.bodhan_client.transcribe(
                 audio_bytes=wav_16k_bytes,
@@ -124,35 +126,53 @@ class SpeechQA:
             raise
         except Exception as e:
             self.logger.warning(
-                f"Back-transcription failed during QA: {e}",
+                f"Back-transcription failed during QA: {e}. Marking as degraded/unverified without burning TTS retries.",
                 stage="qa",
                 lang=lang,
                 segment_id=segment_id,
             )
             hypothesis_text = ""
+            back_transcription_failed = True
+            reasons.append("back_transcription_failed_unverified")
 
-        # Compute CER
-        cer = compute_cer(reference_text, hypothesis_text)
-        if cer >= self.cer_fail:
-            reasons.append(f"cer_high_{cer:.3f}")
-        elif cer >= self.cer_warn:
-            reasons.append(f"cer_warn_{cer:.3f}")
+        # Repetition detector (B14: reference-relative repetition check)
+        has_repeat = False
+        has_tail_omission = False
+        if not back_transcription_failed:
+            raw_has_repeat, repeated_str = detect_repeated_ngrams(
+                hypothesis_text, min_n=1, max_n=3, repeat_threshold=3
+            )
+            # If the repetition also exists in reference_text (e.g. Indic reduplication like "बार-बार"), do NOT flag
+            if raw_has_repeat and repeated_str and repeated_str in reference_text:
+                has_repeat = False
+            elif raw_has_repeat:
+                has_repeat = True
+                reasons.append(f"repetition_{repeated_str}")
 
-        # Repetition detector
-        has_repeat, repeated_str = detect_repeated_ngrams(
-            hypothesis_text, min_n=1, max_n=3, repeat_threshold=3
-        )
-        if has_repeat:
-            reasons.append(f"repetition_{repeated_str}")
+            # Tail omission detector
+            has_tail_omission, tail_str = detect_tail_omission(reference_text, hypothesis_text)
+            if has_tail_omission:
+                reasons.append(f"tail_omission_{tail_str}")
 
-        # Tail omission detector
-        has_tail_omission, tail_str = detect_tail_omission(reference_text, hypothesis_text)
-        if has_tail_omission:
-            reasons.append(f"tail_omission_{tail_str}")
+            # Compute CER
+            cer = compute_cer(reference_text, hypothesis_text)
+            if cer >= self.cer_fail:
+                reasons.append(f"cer_high_{cer:.3f}")
+            elif cer >= self.cer_warn:
+                reasons.append(f"cer_warn_{cer:.3f}")
 
-        passed = (
-            (cer < self.cer_fail) and (not has_repeat) and (not has_tail_omission) and (not clipped)
-        )
+            passed = (
+                (cer < self.cer_fail)
+                and (not has_repeat)
+                and (not has_tail_omission)
+                and (not clipped)
+                and (not silent)
+                and (not is_duration_mismatch)
+            )
+        else:
+            cer = 0.0
+            # If back-transcription endpoint failed, acoustic passes if no audio flaws
+            passed = (not clipped) and (not silent) and (not is_duration_mismatch)
 
         return QAMetrics(
             cer=round(cer, 4),

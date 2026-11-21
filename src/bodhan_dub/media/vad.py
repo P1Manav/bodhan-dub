@@ -64,15 +64,41 @@ class VADResult:
         return sum(r.duration for r in self.speech_regions)
 
 
+def estimate_adaptive_noise_floor(wav_path: Path) -> float:
+    """
+    B5: Computes adaptive percentile-based noise floor from audio frames.
+    Clamped between -45 dBFS and -24 dBFS. Prevents background music or ambient noise
+    from being misclassified as speech.
+    """
+    try:
+        data, sr = sf.read(str(wav_path), dtype="float32")
+        if len(data) == 0:
+            return -32.0
+        frame_len = max(1, int(0.100 * sr))
+        n_frames = len(data) // frame_len
+        if n_frames < 5:
+            return -32.0
+        rms = np.array([np.sqrt(np.mean(data[i * frame_len : (i + 1) * frame_len] ** 2)) for i in range(n_frames)])
+        db = 20 * np.log10(np.maximum(1e-9, rms))
+        floor_db = float(np.percentile(db, 20))
+        adaptive_th = float(np.clip(floor_db + 6.0, -45.0, -24.0))
+        return round(adaptive_th, 1)
+    except Exception:
+        return -32.0
+
+
 def detect_silence_ffmpeg(
     wav_path: Path,
-    noise_db: float = -32.0,
+    noise_db: Optional[float] = None,
     min_silence_duration: float = 0.3,
 ) -> Tuple[List[Pause], float]:
     """
-    Runs ffmpeg silencedetect to find pauses in audio.
+    Runs ffmpeg silencedetect to find pauses in audio using adaptive or explicit noise floor.
     Returns (list_of_pauses, total_duration).
     """
+    if noise_db is None:
+        noise_db = estimate_adaptive_noise_floor(wav_path)
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -136,6 +162,36 @@ def invert_pauses_to_speech(pauses: List[Pause], total_duration: float) -> List[
     return speech
 
 
+SILERO_VAD_DOWNLOAD_URL = (
+    "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
+)
+
+
+def fetch_silero_vad_model(dest_path: Path) -> bool:
+    """
+    B5: Pinned SHA-256 verified download of silero_vad.onnx model.
+    """
+    import urllib.request
+
+    try:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = dest_path.with_suffix(".tmp")
+        urllib.request.urlretrieve(SILERO_VAD_DOWNLOAD_URL, str(temp_path))
+        with open(temp_path, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()
+        if h == SILERO_VAD_PINNED_SHA256:
+            temp_path.replace(dest_path)
+            logger.info(f"Successfully downloaded and verified Silero VAD model to '{dest_path}'")
+            return True
+        else:
+            logger.warning(f"Downloaded model SHA-256 mismatch ({h} != {SILERO_VAD_PINNED_SHA256})")
+            temp_path.unlink(missing_ok=True)
+            return False
+    except Exception as e:
+        logger.warning(f"Could not download Silero VAD model: {e}")
+        return False
+
+
 class SileroVADDetector:
     """ONNX-based Silero VAD implementation with automatic ffmpeg fallback."""
 
@@ -149,7 +205,7 @@ class SileroVADDetector:
         try:
             import onnxruntime as ort
 
-            # C5: Look for silero_vad.onnx in: explicit path, assets/models/, package directory, current directory
+            # C5/B5: Look for silero_vad.onnx in: explicit path, assets/models/, package directory, current directory
             candidates = [
                 self.model_path,
                 Path("assets/models/silero_vad.onnx"),
@@ -164,9 +220,13 @@ class SileroVADDetector:
                     break
 
             if not valid_path:
-                logger.info("Silero VAD model not found in standard asset paths. Using ffmpeg silencedetect fallback.")
-                self._session = None
-                return
+                target_asset = Path("assets/models/silero_vad.onnx")
+                if fetch_silero_vad_model(target_asset):
+                    valid_path = target_asset
+                else:
+                    logger.info("Silero VAD model not available locally or via download. Using ffmpeg silencedetect.")
+                    self._session = None
+                    return
 
             # Verify SHA256 integrity
             try:
@@ -281,10 +341,10 @@ class SileroVADDetector:
                 # Fall back to ffmpeg silencedetect on any runtime error
                 pass
 
-        # Fallback Engine: ffmpeg silencedetect
+        # Fallback Engine: ffmpeg silencedetect (with adaptive noise floor)
         pauses, duration = detect_silence_ffmpeg(
             wav_path,
-            noise_db=-30.0,
+            noise_db=None,
             min_silence_duration=min_silence_ms / 1000.0,
         )
         if duration <= 0.0:
@@ -298,4 +358,21 @@ class SileroVADDetector:
             speech_regions=speech_regions,
             pauses=pauses,
             engine_used="ffmpeg_silencedetect",
+        )
+
+    async def async_process(
+        self,
+        wav_path: Path,
+        threshold: float = 0.5,
+        min_speech_ms: float = 250.0,
+        min_silence_ms: float = 200.0,
+    ) -> VADResult:
+        """B8: Offloads VAD processing to a background thread to keep event loop responsive."""
+        import asyncio
+        return await asyncio.to_thread(
+            self.process,
+            wav_path,
+            threshold=threshold,
+            min_speech_ms=min_speech_ms,
+            min_silence_ms=min_silence_ms,
         )

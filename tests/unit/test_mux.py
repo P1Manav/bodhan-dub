@@ -5,10 +5,11 @@ Unit tests for video/audio muxing and verification.
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 from bodhan_dub.logging import PipelineLogger
-from bodhan_dub.media.mux import mux_and_verify, probe_media_streams
+from bodhan_dub.media.mux import MuxError, mux_and_verify, probe_media_streams
 from tests.e2e.test_smoke import generate_synthetic_mp4
 
 
@@ -69,3 +70,21 @@ def test_mux_preserves_duration_and_raises_on_severe_desync(tmp_path: Path):
     )
     assert res.verified is True
     assert abs(res.video_duration_s - 5.0) < 0.1
+
+
+def test_mux_no_audio(tmp_path: Path):
+    """B3: Test mux fails when audio file is empty or missing."""
+    video_path = generate_synthetic_mp4(tmp_path / "source_1s.mp4", duration_s=1)
+    audio_path = tmp_path / "empty_audio.wav"
+    audio_path.touch()
+
+    out_mp4 = tmp_path / "out_no_audio.mp4"
+    logger = PipelineLogger(run_id="test_run")
+    with pytest.raises(MuxError):
+        mux_and_verify(
+            video_path=video_path,
+            audio_path=audio_path,
+            output_mp4_path=out_mp4,
+            lang="hi",
+            logger=logger,
+        )

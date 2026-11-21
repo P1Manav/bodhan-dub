@@ -29,6 +29,7 @@ class RunManifest(BaseModel):
     updated_at: str = Field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     stages: Dict[str, StageStatus] = Field(default_factory=dict)
     completed_segments: Dict[str, List[str]] = Field(default_factory=dict)  # lang -> [segment_ids]
+    segment_hashes: Dict[str, Dict[str, str]] = Field(default_factory=dict)  # lang -> {seg_id: hash}
 
     def mark_stage_start(self, stage: str) -> None:
         self.stages[stage] = StageStatus(
@@ -68,15 +69,31 @@ class RunManifest(BaseModel):
         st = self.stages.get(stage)
         return st is not None and st.status == "completed"
 
-    def record_completed_segment(self, lang: str, segment_id: str) -> None:
+    def record_completed_segment(
+        self, lang: str, segment_id: str, content_hash: Optional[str] = None
+    ) -> None:
+        """B15: Records segment completion with optional cryptographic content hash."""
         if lang not in self.completed_segments:
             self.completed_segments[lang] = []
         if segment_id not in self.completed_segments[lang]:
             self.completed_segments[lang].append(segment_id)
+        if content_hash:
+            if lang not in self.segment_hashes:
+                self.segment_hashes[lang] = {}
+            self.segment_hashes[lang][segment_id] = content_hash
         self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
-    def is_segment_completed(self, lang: str, segment_id: str) -> bool:
-        return segment_id in self.completed_segments.get(lang, [])
+    def is_segment_completed(
+        self, lang: str, segment_id: str, content_hash: Optional[str] = None
+    ) -> bool:
+        """B15: Verifies segment completion matching content hash."""
+        if segment_id not in self.completed_segments.get(lang, []):
+            return False
+        if content_hash and lang in self.segment_hashes:
+            expected = self.segment_hashes[lang].get(segment_id)
+            if expected and expected != content_hash:
+                return False
+        return True
 
     def save(self, filepath: Path) -> None:
         """Atomically persists manifest to disk."""

@@ -8,18 +8,28 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
+import httpx
 import rapidfuzz
 import soundfile as sf
 
 from bodhan_dub.gateway.bodhan import BodhanClient
+from bodhan_dub.gateway.cost import BudgetExceededError
+from bodhan_dub.gateway.resilience import CircuitBreakerOpen
 from bodhan_dub.logging import PipelineLogger
 from bodhan_dub.media.chunks import AudioChunk
 from bodhan_dub.media.vad import SpeechRegion, VADResult
 from bodhan_dub.text.normalize import detect_repeated_ngrams
+
+
+class ASRError(Exception):
+    """B1: Raised when ASR stage encounters a fatal error or authentication failure."""
+
+    pass
 
 
 @dataclass
@@ -27,7 +37,146 @@ class TranscribedSegment:
     text: str
     start: float
     end: float
-    timestamp_source: str  # "api_verbose" or "vad_derived"
+    timestamp_source: str  # "api_snapped", "api_raw", or "vad_proportional"
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+def snap_segment_to_vad(
+    start: float,
+    end: float,
+    speech_regions: List[SpeechRegion],
+    snap_tolerance_s: float = 0.400,
+) -> Tuple[float, float, str]:
+    """
+    B4 (a): Snaps raw segment start and end to nearest VAD speech region boundaries.
+    Returns (snapped_start, snapped_end, source_tag) where source_tag is
+    'api_snapped' if snapped or 'api_raw' if no boundary was within tolerance.
+    """
+    snapped_start = start
+    snapped_end = end
+    did_snap = False
+
+    for r in speech_regions:
+        if abs(start - r.start) <= snap_tolerance_s:
+            snapped_start = r.start
+            did_snap = True
+            break
+        elif abs(start - r.end) <= snap_tolerance_s:
+            snapped_start = r.end
+            did_snap = True
+            break
+
+    for r in speech_regions:
+        if abs(end - r.end) <= snap_tolerance_s:
+            snapped_end = r.end
+            did_snap = True
+            break
+        elif abs(end - r.start) <= snap_tolerance_s:
+            snapped_end = r.start
+            did_snap = True
+            break
+
+    if snapped_end <= snapped_start:
+        snapped_start = start
+        snapped_end = end
+        did_snap = False
+
+    source_tag = "api_snapped" if did_snap else "api_raw"
+    return round(snapped_start, 3), round(snapped_end, 3), source_tag
+
+
+def allocate_proportional_vad_segments(
+    text: str,
+    start_s: float,
+    end_s: float,
+    speech_regions: List[SpeechRegion],
+) -> List[TranscribedSegment]:
+    """
+    B4 (b): When API returns unsegmented text without timestamps, split text into sentences
+    and allocate boundaries proportionally by character count inside chunk's VAD speech regions,
+    snapping to internal pauses. Never use raw chunk bounds as segment start/end.
+    """
+    chunk_regions = [
+        r for r in speech_regions
+        if r.end > start_s and r.start < end_s
+    ]
+    if not chunk_regions:
+        mid = (start_s + end_s) / 2.0
+        return [
+            TranscribedSegment(
+                text=text.strip(),
+                start=round(mid, 3),
+                end=round(mid, 3),
+                timestamp_source="vad_proportional",
+            )
+        ]
+
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if not raw_sentences:
+        raw_sentences = [text.strip()]
+
+    total_chars = sum(len(s) for s in raw_sentences)
+    if total_chars == 0:
+        return []
+
+    clamped_regions = [
+        (max(start_s, r.start), min(end_s, r.end))
+        for r in chunk_regions
+    ]
+    total_speech_dur = sum(r_end - r_start for r_start, r_end in clamped_regions)
+
+    if total_speech_dur <= 0.05:
+        first_start = clamped_regions[0][0]
+        return [
+            TranscribedSegment(
+                text=text.strip(),
+                start=round(first_start, 3),
+                end=round(first_start + 0.1, 3),
+                timestamp_source="vad_proportional",
+            )
+        ]
+
+    results: List[TranscribedSegment] = []
+    curr_region_idx = 0
+    curr_offset_in_region = 0.0
+
+    for sentence in raw_sentences:
+        fraction = len(sentence) / total_chars
+        sentence_dur = fraction * total_speech_dur
+
+        r_start, r_end = clamped_regions[curr_region_idx]
+        seg_start = r_start + curr_offset_in_region
+
+        rem_dur = sentence_dur
+        seg_end = seg_start + rem_dur
+        while curr_region_idx < len(clamped_regions):
+            r_start, r_end = clamped_regions[curr_region_idx]
+            avail = (r_end - r_start) - curr_offset_in_region
+            if rem_dur <= avail:
+                seg_end = (r_start + curr_offset_in_region) + rem_dur
+                curr_offset_in_region += rem_dur
+                break
+            else:
+                rem_dur -= avail
+                curr_region_idx += 1
+                curr_offset_in_region = 0.0
+                if curr_region_idx >= len(clamped_regions):
+                    seg_end = clamped_regions[-1][1]
+                    break
+
+        results.append(
+            TranscribedSegment(
+                text=sentence,
+                start=round(seg_start, 3),
+                end=round(max(seg_start + 0.05, seg_end), 3),
+                timestamp_source="vad_proportional",
+            )
+        )
+
+    return results
 
     @property
     def duration(self) -> float:
@@ -147,25 +296,26 @@ class ASRStage:
                             s_text = s.get("text", "").strip()
                             if not s_text:
                                 continue
-                            seg_start = start_s + float(s.get("start", 0.0))
-                            seg_end = min(end_s, start_s + float(s.get("end", duration)))
+                            raw_start = start_s + float(s.get("start", 0.0))
+                            raw_end = min(end_s, start_s + float(s.get("end", duration)))
+                            snapped_start, snapped_end, source_tag = snap_segment_to_vad(
+                                raw_start, raw_end, vad_result.speech_regions
+                            )
                             results.append(
                                 TranscribedSegment(
                                     text=s_text,
-                                    start=round(seg_start, 3),
-                                    end=round(seg_end, 3),
-                                    timestamp_source="api_verbose",
+                                    start=snapped_start,
+                                    end=snapped_end,
+                                    timestamp_source=source_tag,
                                 )
                             )
                     else:
-                        # Single segment for entire chunk
-                        results.append(
-                            TranscribedSegment(
-                                text=text,
-                                start=round(start_s, 3),
-                                end=round(end_s, 3),
-                                timestamp_source="vad_derived",
-                            )
+                        # B4: Proportional boundary allocation within VAD regions
+                        results = allocate_proportional_vad_segments(
+                            text=text,
+                            start_s=start_s,
+                            end_s=end_s,
+                            speech_regions=vad_result.speech_regions,
                         )
                     return results
 
@@ -179,7 +329,42 @@ class ASRStage:
                     await asyncio.sleep(0.5)
                     continue
 
+            except (BudgetExceededError, CircuitBreakerOpen):
+                # B1: Always re-raise budget exhaustion and open circuit breaker
+                raise
+            except httpx.HTTPStatusError as e:
+                # B1: Non-retryable HTTP errors (400, 401, 403) must be re-raised immediately
+                if e.response.status_code in (400, 401, 403):
+                    self.logger.error(
+                        f"Fatal non-retryable HTTP {e.response.status_code} in ASR chunk {chunk_id}: {e}",
+                        stage="asr",
+                        segment_id=f"chunk_{chunk_id}",
+                    )
+                    raise
+                # Transient HTTP error (408, 429, 5xx) gets retried
+                self.logger.warning(
+                    f"Transient HTTP {e.response.status_code} in ASR chunk {chunk_id} attempt {attempt}: {e}",
+                    stage="asr",
+                    segment_id=f"chunk_{chunk_id}",
+                )
+                if attempt == 1:
+                    await asyncio.sleep(1.0)
+                    continue
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                # Transient network error gets retried
+                self.logger.warning(
+                    f"Transient network/timeout error in ASR chunk {chunk_id} attempt {attempt}: {e}",
+                    stage="asr",
+                    segment_id=f"chunk_{chunk_id}",
+                )
+                if attempt == 1:
+                    await asyncio.sleep(1.0)
+                    continue
             except Exception as e:
+                if isinstance(e, (BudgetExceededError, CircuitBreakerOpen)):
+                    raise
+                if hasattr(e, "response") and getattr(e.response, "status_code", None) in (400, 401, 403):
+                    raise
                 self.logger.warning(
                     f"Chunk {chunk_id} transcription attempt {attempt} failed: {e}",
                     stage="asr",
@@ -287,5 +472,12 @@ class ASRStage:
                     deduped.append(seg)
             else:
                 deduped.append(seg)
+
+        if vad_result.has_speech and not deduped:
+            self.logger.error(
+                "ASR failure: VAD detected speech but zero segments survived transcription and filtering",
+                stage="asr",
+            )
+            raise ASRError("ASR failed: VAD detected active speech but zero segments were transcribed")
 
         return deduped

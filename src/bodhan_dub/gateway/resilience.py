@@ -75,6 +75,24 @@ class CircuitBreakerRegistry:
         return self._breakers[key]
 
 
+def parse_retry_after(retry_after_str: Optional[str], default_backoff: float = 1.0) -> float:
+    """B18: Parses Retry-After header as either seconds or HTTP-date."""
+    if not retry_after_str:
+        return default_backoff
+    s = retry_after_str.strip()
+    try:
+        return max(0.1, float(s))
+    except ValueError:
+        pass
+    try:
+        import email.utils
+        dt = email.utils.parsedate_to_datetime(s)
+        diff = dt.timestamp() - time.time()
+        return max(0.1, diff)
+    except Exception:
+        return default_backoff
+
+
 def should_retry_exception(exc: BaseException) -> bool:
     """Retry on network timeouts, connection errors, and 429/5xx status codes."""
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)):
@@ -120,11 +138,8 @@ async def execute_with_resilience(
                 # Check for 429 / 5xx to trigger retry
                 if resp.status_code == 429:
                     retry_after_str = resp.headers.get("Retry-After")
-                    wait_sec = (
-                        float(retry_after_str)
-                        if retry_after_str
-                        else (1.5**attempt.retry_state.attempt_number)
-                    )
+                    base_wait = 1.5**attempt.retry_state.attempt_number
+                    wait_sec = parse_retry_after(retry_after_str, default_backoff=base_wait)
                     wait_sec += random.uniform(0.1, 0.5)
                     # Semaphore is released before sleeping!
                     await asyncio.sleep(wait_sec)
@@ -144,6 +159,11 @@ async def execute_with_resilience(
                     circuit_breaker.record_success()
                 return resp
 
+            except (httpx.TimeoutException, httpx.ConnectTimeout):
+                # B18: Count network timeouts toward circuit breaker failure count (504 Gateway Timeout)
+                if circuit_breaker:
+                    circuit_breaker.record_failure(504)
+                raise
             except httpx.HTTPStatusError as e:
                 if circuit_breaker and e.response.status_code >= 500:
                     circuit_breaker.record_failure(e.response.status_code)

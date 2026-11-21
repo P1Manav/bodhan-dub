@@ -9,13 +9,18 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import soundfile as sf
 from pydantic import BaseModel
 
 from bodhan_dub.logging import PipelineLogger
+
+
+class MuxError(Exception):
+    """B3: Raised when multiplexing or container verification fails."""
+    pass
 
 
 class MuxResult(BaseModel):
@@ -25,6 +30,8 @@ class MuxResult(BaseModel):
     duration_delta_ms: float
     verified: bool
     repair_attempts: int = 0
+    measured_lufs: Optional[float] = None
+    measured_tp_dbtp: Optional[float] = None
     error: Optional[str] = None
 
 
@@ -176,23 +183,70 @@ def mux_and_verify(
     raise_on_failure: bool = True,
 ) -> MuxResult:
     """
-    Multiplexes video and audio, validates duration match within ±100ms,
-    runs bounded repair if delta exceeds tolerance, and raises error if desynced.
+    B3 & B12: Multiplexes video and audio, validates duration match within ±100ms,
+    verifies loudness (-16 ± 1 LUFS, ceiling -1 dBTP), verifies presence of audio stream,
+    runs bounded repair if delta exceeds tolerance, and cleans up intermediate repair WAVs.
     """
+    from bodhan_dub.media.loudness import measure_loudness, measure_true_peak_dbtp
+
     repair_attempts = 0
     current_audio_path = audio_path
     last_delta_ms = 0.0
+    created_repairs: List[Path] = []
+
+    # Fast validation: audio file must exist and have content
+    if not audio_path.exists() or audio_path.stat().st_size == 0:
+        msg = f"Audio file '{audio_path}' is empty or does not exist."
+        if raise_on_failure:
+            raise MuxError(msg)
+        return MuxResult(
+            output_path=str(output_mp4_path),
+            video_duration_s=0.0,
+            audio_duration_s=0.0,
+            duration_delta_ms=0.0,
+            verified=False,
+            repair_attempts=0,
+            error=msg,
+        )
 
     # Probe input video duration for strict duration match check
     in_probe = probe_media_streams(video_path)
     target_video_dur = get_stream_duration(in_probe, "video")
 
     while repair_attempts <= 2:
-        mux_video_audio(video_path, current_audio_path, output_mp4_path, lang, logger)
+        try:
+            mux_video_audio(video_path, current_audio_path, output_mp4_path, lang, logger)
+        except Exception as e:
+            if raise_on_failure:
+                raise MuxError(f"Muxing failed: {e}") from e
+            return MuxResult(
+                output_path=str(output_mp4_path),
+                video_duration_s=0.0,
+                audio_duration_s=0.0,
+                duration_delta_ms=0.0,
+                verified=False,
+                repair_attempts=repair_attempts,
+                error=f"Muxing failed: {e}",
+            )
 
         # ffprobe verification
         try:
             probe = probe_media_streams(output_mp4_path)
+            audio_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+            if not audio_streams:
+                msg = f"Mux output '{output_mp4_path}' has no audio stream."
+                if raise_on_failure:
+                    raise MuxError(msg)
+                return MuxResult(
+                    output_path=str(output_mp4_path),
+                    video_duration_s=0.0,
+                    audio_duration_s=0.0,
+                    duration_delta_ms=0.0,
+                    verified=False,
+                    repair_attempts=repair_attempts,
+                    error=msg,
+                )
+
             v_dur = get_stream_duration(probe, "video")
             a_dur = get_stream_duration(probe, "audio")
             delta_ms = abs(v_dur - a_dur) * 1000.0
@@ -202,6 +256,33 @@ def mux_and_verify(
             input_delta_ms = abs(v_dur - target_video_dur) * 1000.0
 
             if delta_ms <= 100.0 and input_delta_ms <= 100.0:
+                # Measure loudness of muxed audio
+                meas_lufs = None
+                meas_tp = None
+                try:
+                    aud_data, aud_sr = sf.read(str(current_audio_path), dtype="float32")
+                    meas_lufs = measure_loudness(aud_data, aud_sr)
+                    meas_tp = measure_true_peak_dbtp(aud_data)
+                    if meas_lufs > -60.0:
+                        if meas_lufs < -17.0 or meas_lufs > -15.0 or meas_tp > -1.0:
+                            loudness_err = (
+                                f"Mux loudness check failed: measured {meas_lufs:.2f} LUFS / "
+                                f"{meas_tp:.2f} dBTP (requires -16±1 LUFS and <= -1 dBTP)"
+                            )
+                            if raise_on_failure:
+                                raise MuxError(loudness_err)
+                except MuxError:
+                    raise
+                except Exception as ex:
+                    logger.warning(f"Could not verify audio loudness on mux: {ex}", stage="mux")
+
+                # B12: Clean up intermediate repaired audio files on success
+                for rep in created_repairs:
+                    try:
+                        rep.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
                 return MuxResult(
                     output_path=str(output_mp4_path),
                     video_duration_s=round(v_dur, 3),
@@ -209,6 +290,8 @@ def mux_and_verify(
                     duration_delta_ms=round(delta_ms, 1),
                     verified=True,
                     repair_attempts=repair_attempts,
+                    measured_lufs=round(meas_lufs, 2) if meas_lufs is not None else None,
+                    measured_tp_dbtp=round(meas_tp, 2) if meas_tp is not None else None,
                 )
 
             # If duration delta > 100ms and repairs left, pad/trim audio WAV to exact video duration
@@ -222,6 +305,7 @@ def mux_and_verify(
                 repaired_wav_path = (
                     output_mp4_path.parent / f"repaired_audio_a{repair_attempts}.wav"
                 )
+                created_repairs.append(repaired_wav_path)
                 audio_data, sr = sf.read(str(current_audio_path), dtype="float32")
                 target_samples = int(round(v_dur * sr))
 
@@ -236,9 +320,11 @@ def mux_and_verify(
             else:
                 break
 
+        except MuxError:
+            raise
         except Exception as e:
             if raise_on_failure:
-                raise RuntimeError(f"ffprobe verification failed: {e}") from e
+                raise MuxError(f"ffprobe verification failed: {e}") from e
             return MuxResult(
                 output_path=str(output_mp4_path),
                 video_duration_s=0.0,
@@ -251,7 +337,7 @@ def mux_and_verify(
 
     msg = f"Mux verification failed: duration delta {last_delta_ms:.1f}ms exceeds ±100ms tolerance after repairs"
     if raise_on_failure:
-        raise RuntimeError(msg)
+        raise MuxError(msg)
 
     return MuxResult(
         output_path=str(output_mp4_path),

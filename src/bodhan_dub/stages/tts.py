@@ -34,6 +34,11 @@ class CPSCalibrator:
         # C3: asyncio.Lock for atomic updates across concurrent synthesis tasks
         self.lock = asyncio.Lock()
 
+    def is_warmed_up(self, lang: str, voice: str, min_samples: int = 3) -> bool:
+        """B7: True when at least min_samples (default 3) real measurements exist for (lang, voice)."""
+        key = (lang, voice)
+        return len(self.history.get(key, [])) >= min_samples
+
     def get_cps(self, lang: str, voice: str) -> float:
         """Returns running median or EWMA CPS for given voice profile."""
         key = (lang, voice)
@@ -77,17 +82,26 @@ class CPSCalibrator:
 
 def split_text_at_punctuation(text: str, max_chars: int = 180) -> List[str]:
     """
-    Splits text at clause/sentence punctuation (danda ।, ., ?, ,, !)
-    ensuring each piece is <= max_chars to prevent server truncation.
+    B10: Robust text chunking for TTS synthesis:
+    1. Splits at clause/sentence punctuation (dandas ।, ॥, ?, !, newlines, and . / , not inside numbers).
+    2. Protects decimal numbers (e.g. 3.14), abbreviations (e.g. U.S.A., Dr.), and numbers with commas (e.g. 10,000).
+    3. If any piece still exceeds max_chars, falls back to splitting at whitespace.
+    4. If any single word still exceeds max_chars, splits at grapheme cluster boundaries (\\X).
+    Ensures every resulting chunk is <= max_chars.
     """
     t_clean = text.strip()
     if len(t_clean) <= max_chars:
         return [t_clean]
 
-    # Split preserving delimiters using regex \X
-    # Indic danda: \u0964, double danda: \u0965
-    tokens = regex.split(r"([।॥\.\?!,;\n]\s*)", t_clean)
-    pieces: List[str] = []
+    # Regex splitting on punctuation, protecting decimals and numbers with commas:
+    # Match:
+    # - Indic dandas: [।॥]
+    # - Newlines: \n+
+    # - Sentence/clause punctuation: (?<!\d)[.?!;](?!\d) or (?<!\d),(?!\d)
+    split_pattern = r"([।॥\n]|(?<!\d)[.?!;](?!\d)|(?<!\d),(?!\d))\s*"
+    tokens = regex.split(split_pattern, t_clean)
+
+    chunks: List[str] = []
     curr = ""
 
     for token in tokens:
@@ -97,13 +111,45 @@ def split_text_at_punctuation(text: str, max_chars: int = 180) -> List[str]:
             curr += token
         else:
             if curr.strip():
-                pieces.append(curr.strip())
+                chunks.append(curr.strip())
             curr = token
 
     if curr.strip():
-        pieces.append(curr.strip())
+        chunks.append(curr.strip())
 
-    return pieces if pieces else [t_clean]
+    # Secondary pass: if any chunk still > max_chars, split on whitespace
+    refined_chunks: List[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            refined_chunks.append(chunk)
+            continue
+
+        words = chunk.split()
+        sub_curr = ""
+        for w in words:
+            if len(sub_curr) + len(w) + 1 <= max_chars:
+                sub_curr = f"{sub_curr} {w}".strip()
+            else:
+                if sub_curr:
+                    refined_chunks.append(sub_curr)
+                # If a single word itself exceeds max_chars, split on grapheme clusters (\X)
+                if len(w) > max_chars:
+                    graphemes = regex.findall(r"\X", w)
+                    g_curr = ""
+                    for g in graphemes:
+                        if len(g_curr) + len(g) <= max_chars:
+                            g_curr += g
+                        else:
+                            if g_curr:
+                                refined_chunks.append(g_curr)
+                            g_curr = g
+                    sub_curr = g_curr
+                else:
+                    sub_curr = w
+        if sub_curr:
+            refined_chunks.append(sub_curr)
+
+    return [c for c in refined_chunks if c.strip()] or [t_clean]
 
 
 class TTSSynthesizer:
@@ -144,22 +190,12 @@ class TTSSynthesizer:
             if nonce is not None:
                 speak_kwargs["nonce"] = nonce
 
-            try:
-                raw_wav_bytes = await self.bodhan_client.speak(
-                    text=piece,
-                    voice=voice,
-                    language_code=lang,
-                    **speak_kwargs,
-                )
-            except TypeError:
-                raw_wav_bytes = await self.bodhan_client.speak(
-                    text=piece,
-                    voice=voice,
-                    language_code=lang,
-                    stage="tts",
-                    lang=lang,
-                    segment_id=piece_id,
-                )
+            raw_wav_bytes = await self.bodhan_client.speak(
+                text=piece,
+                voice=voice,
+                language_code=lang,
+                **speak_kwargs,
+            )
 
             # Read 24kHz audio from bytes
             with io.BytesIO(raw_wav_bytes) as buf:

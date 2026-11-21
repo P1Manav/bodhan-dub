@@ -31,6 +31,7 @@ from bodhan_dub.policy import (
     contains_indic_or_arabic,
     validate_llm_text,
 )
+from bodhan_dub.preflight import PreflightError
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -106,6 +107,15 @@ def deterministic_retry_action(failure_reasons: List[str], previous_actions: Lis
     return "split_text"
 
 
+def sanitize_data_payload(text: str) -> str:
+    """B19: Escapes/strips </data>, <data>, and delimiter tokens in untrusted transcript text."""
+    if not text:
+        return ""
+    cleaned = text.replace("</data>", "&lt;/data&gt;").replace("<data>", "&lt;data&gt;")
+    cleaned = cleaned.replace("```", "'''")
+    return cleaned
+
+
 class LLMClient:
     """Manages English-only LLM queries with HostAllowlistGuard, JSON validation, and resilience."""
 
@@ -123,16 +133,28 @@ class LLMClient:
         self.logger = logger
         self.sem_llm = asyncio.Semaphore(settings.semaphore_llm)
 
-        # C1: Host allowlist enforcement
-        allowed_hosts = [
-            "api.openai.com",
-            "api.groq.com",
-            "openrouter.ai",
-            "api.together.xyz",
-        ]
-        self.allowlist_guard = HostAllowlistGuard(allowed_hosts)
-        # Fail fast in __init__ if settings.llm_base_url is outside allowlist
-        self.allowlist_guard.check_url(settings.llm_base_url)
+        # B2: Derive allowed host dynamically from settings.llm_base_url (remove hardcoded provider list)
+        import os
+        import sys
+        from urllib.parse import urlparse
+
+        parsed = urlparse(settings.llm_base_url)
+        llm_host = (parsed.hostname or "").lower()
+        if not llm_host:
+            raise PreflightError(f"Invalid LLM_BASE_URL: '{settings.llm_base_url}'")
+
+        # B19: HostAllowlistGuard allows localhost/127.0.0.1/testserver only under test flag
+        allow_test = bool(
+            os.getenv("BODHAN_ALLOW_TEST_HOSTS", "0") in ("1", "true", "True")
+            or "pytest" in sys.modules
+        )
+        self.allowlist_guard = HostAllowlistGuard([llm_host], allow_test_hosts=allow_test)
+
+        # Fail fast in __init__ if settings.llm_base_url fails check
+        try:
+            self.allowlist_guard.check_url(settings.llm_base_url)
+        except PolicyViolation as e:
+            raise PreflightError(f"Policy Guard rejected LLM host '{llm_host}': {e}") from e
 
         self._http = httpx.AsyncClient(
             base_url=settings.llm_base_url,
@@ -402,7 +424,7 @@ class LLMClient:
             'Return ONLY JSON conforming to: {"terms": ["term1", "term2", ...]}.'
         )
         user_prompt = (
-            f"Transcript data:\n<data>\n{transcript[:4000]}\n</data>\n"
+            f"Transcript data:\n<data>\n{sanitize_data_payload(transcript[:4000])}\n</data>\n"
             "Extract key entities, acronyms, and technical terms."
         )
 
@@ -457,7 +479,7 @@ class LLMClient:
             '2. Return ONLY valid JSON in format: {"condensed_en": "<condensed English text>"}\n'
             "3. Do not include any explanation or non-English text."
         )
-        user_prompt = f"Original English:\n<data>\n{source_en}\n</data>"
+        user_prompt = f"Original English:\n<data>\n{sanitize_data_payload(source_en)}\n</data>"
 
         res: CondensedEnglishResponse = await self.query_json(
             system_prompt=system_prompt,
@@ -490,7 +512,7 @@ class LLMClient:
             '2. Return ONLY valid JSON in format: {"paraphrased_en": "<paraphrased English text>", "paraphrase": "<paraphrased English text>"}\n'
             "3. Do not include any non-English text."
         )
-        user_prompt = f"Original English:\n<data>\n{source_en}\n</data>"
+        user_prompt = f"Original English:\n<data>\n{sanitize_data_payload(source_en)}\n</data>"
 
         res: ParaphrasedEnglishResponse = await self.query_json(
             system_prompt=system_prompt,
@@ -526,8 +548,8 @@ class LLMClient:
             "Only flag 'mistranslation' or 'omission' if there is an unambiguous, critical discrepancy."
         )
         user_prompt = (
-            f"Original English:\n<data>\n{source_en}\n</data>\n\n"
-            f"Back-translated English:\n<data>\n{back_en}\n</data>\n"
+            f"Original English:\n<data>\n{sanitize_data_payload(source_en)}\n</data>\n\n"
+            f"Back-translated English:\n<data>\n{sanitize_data_payload(back_en)}\n</data>\n"
             "Provide verdict and brief evidence."
         )
 
@@ -559,7 +581,7 @@ class LLMClient:
             'Return ONLY JSON matching the schema: {"merge_indices": [[0, 1], ...]}.'
         )
         user_prompt = (
-            f"Numbered transcript DATA:\n<data>\n{numbered_lines}\n</data>\n"
+            f"Numbered transcript DATA:\n<data>\n{sanitize_data_payload(numbered_lines)}\n</data>\n"
             "Identify pairs of adjacent indices to merge for better sentence structure."
         )
 

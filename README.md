@@ -1,6 +1,6 @@
 # bodhan_dub: Autonomous English-to-Indic Video Dubbing Pipeline
 
-An autonomous, production-grade video dubbing system that translates and dubs English videos into **13 production-tier Indian languages** using **strictly Bodhan Indic AI models** (`indic-transcribe`, `indic-translate`, `indic-speak`).
+An autonomous, production-grade video dubbing system that translates and dubs English videos into **12 target Indic languages** (13 production-tier languages including source English in `languages.yaml`) using **strictly Bodhan Indic AI models** (`indic-transcribe`, `indic-translate`, `indic-speak`).
 
 All generated output media is formally labeled as **AI-dubbed** via container metadata tags, structured pipeline reports (`report.json`), and subtitle sidecars.
 
@@ -44,10 +44,7 @@ The system strictly adheres to the five architectural workflows specified in `do
 ├── docs/                      # Architectural specifications & decision records
 │   ├── ARCHITECTURE.md        # 5 Mermaid architecture diagrams
 │   ├── API_FACTS.md           # Live Bodhan API probe benchmarks & limits
-│   ├── DECISIONS.md           # Architecture Decision Records (ADRs)
-│   ├── DESIGN_NOTES.md        # Detailed module design specifications
-│   ├── FAILURE_MODES.md       # Edge cases and mitigation strategies
-│   └── PR_DESCRIPTION.md     # Production pull request documentation
+│   └── DECISIONS.md           # Architecture Decision Records (ADRs)
 ├── scripts/
 │   └── probe.py               # Live API verification probe
 ├── src/bodhan_dub/            # Pipeline implementation
@@ -153,7 +150,7 @@ python -m bodhan_dub --input path/to/video.mp4 --langs hi,ta,bn --estimate-only
 
 ## Supported Production Languages
 
-Loaded dynamically from `languages.yaml`:
+Loaded dynamically from `languages.yaml` (1 source language `en` + 12 target Indic languages):
 - **Assamese (`as`)**
 - **Bengali (`bn`)**
 - **Gujarati (`gu`)**
@@ -206,4 +203,4 @@ make check
 - `0`: All requested languages processed successfully (status `ok` or `degraded`).
 - `1`: At least one language failed (partial outputs and `report.json` preserved).
 - `2`: Preflight or usage error (missing streams, duration outside bounds, unknown language, budget exceeded).
-- `130`: Interrupted by user (SIGINT / Ctrl-C; writes partial manifest).
+- `130`: Interrupted by user (SIGINT/SIGTERM); partial outputs, manifest, and report flushed.

@@ -6,12 +6,13 @@ pipelines in parallel with full error isolation and resume checkpointing.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import numpy as np
@@ -27,8 +28,14 @@ from bodhan_dub.logging import PipelineLogger
 from bodhan_dub.manifest import RunManifest
 from bodhan_dub.media.chunks import ChunkPlanner
 from bodhan_dub.media.extract import extract_audio_for_asr, extract_audio_original
+from bodhan_dub.media.loudness import measure_loudness
 from bodhan_dub.media.mix import mix_dubbed_audio
-from bodhan_dub.media.mux import mux_and_verify
+from bodhan_dub.media.mux import (
+    MuxResult,
+    get_stream_duration,
+    mux_and_verify,
+    probe_media_streams,
+)
 from bodhan_dub.media.vad import SileroVADDetector, VADResult
 from bodhan_dub.stages.asr import ASRStage
 from bodhan_dub.stages.fit import SegmentFitController, SegmentFitResult
@@ -131,7 +138,9 @@ class PipelineOrchestrator:
         audio_orig = self.work_dir / "audio_original.wav"
 
         extract_audio_for_asr(video_path, audio_16k)
-        extract_audio_original(video_path, audio_orig)
+        probe_info = probe_media_streams(video_path)
+        v_dur = get_stream_duration(probe_info, "video")
+        extract_audio_original(video_path, audio_orig, target_duration=v_dur)
 
         # C4: Background music separation if requested
         self.separate_music_vocal_path = None
@@ -144,7 +153,7 @@ class PipelineOrchestrator:
                 tool = demucs_bin or spleeter_bin
                 try:
                     cmd = [tool, "-n", "htdemucs", "--two-stems", "vocals", "-o", str(self.work_dir), str(audio_orig)]
-                    subprocess.run(cmd, capture_output=True, check=True)
+                    await asyncio.to_thread(subprocess.run, cmd, capture_output=True, check=True)
                     vocal_candidate = self.work_dir / "htdemucs" / audio_orig.stem / "vocals.wav"
                     if vocal_candidate.exists():
                         self.separate_music_vocal_path = vocal_candidate
@@ -167,7 +176,7 @@ class PipelineOrchestrator:
         self.manifest.mark_stage_start("vad")
         self.logger.info("Running Voice Activity Detection (Silero/ffmpeg)...", stage="vad")
         vad_detector = SileroVADDetector()
-        vad_result = vad_detector.process(audio_16k)
+        vad_result = await vad_detector.async_process(audio_16k)
         self.logger.info(
             f"VAD complete ({vad_result.engine_used}): {len(vad_result.speech_regions)} speech regions, "
             f"total speech {vad_result.total_speech_duration:.1f}s / {vad_result.total_duration:.1f}s",
@@ -365,9 +374,20 @@ class PipelineOrchestrator:
                 )
                 return idx, res, None
 
-            # C4: Check checkpoint for --resume
+            # B15: Compute content-based checkpoint hash
+            import hashlib
+            seg_hash = hashlib.sha256(
+                f"{seg.text}|{tr_info.target_text}|{seg_voice}|{lang}".encode("utf-8")
+            ).hexdigest()
+
             cached_wav = lang_work_dir / f"{seg.segment_id}.wav"
-            if self.resume and self.manifest.is_segment_completed(lang, seg.segment_id) and cached_wav.exists():
+            cached_meta = lang_work_dir / f"{seg.segment_id}.meta.json"
+
+            if (
+                self.resume
+                and self.manifest.is_segment_completed(lang, seg.segment_id, content_hash=seg_hash)
+                and cached_wav.exists()
+            ):
                 try:
                     c_audio, c_sr = sf.read(str(cached_wav), dtype="float32")
                     c_dur = len(c_audio) / float(c_sr)
@@ -377,22 +397,27 @@ class PipelineOrchestrator:
                         lang=lang,
                         segment_id=seg.segment_id,
                     )
-                    res = SegmentFitResult(
-                        segment_id=seg.segment_id,
-                        source_en=seg.text,
-                        final_en=seg.text,
-                        final_translation=tr_info.target_text,
-                        raw_duration=c_dur,
-                        final_duration=c_dur,
-                        slot_duration=seg.slot_duration,
-                        start_shift=0.0,
-                        speed_factor=1.0,
-                        qa_metrics=QAMetrics(cer=0.0, passed=True, failure_reasons=[]),
-                        qa_status="passed",
-                        fit_status="fit_exact",
-                        attempts=1,
-                        reasons=[],
-                    )
+                    if cached_meta.exists():
+                        saved_meta = json.loads(cached_meta.read_text(encoding="utf-8"))
+                        res = SegmentFitResult(**saved_meta["res"], raw_audio=c_audio.copy())
+                    else:
+                        res = SegmentFitResult(
+                            segment_id=seg.segment_id,
+                            source_en=seg.text,
+                            final_en=seg.text,
+                            final_translation=tr_info.target_text,
+                            raw_duration=c_dur,
+                            final_duration=c_dur,
+                            slot_duration=seg.slot_duration,
+                            start_shift=0.0,
+                            speed_factor=1.0,
+                            qa_metrics=QAMetrics(cer=0.0, passed=True, failure_reasons=[]),
+                            qa_status="passed",
+                            fit_status="fit_exact",
+                            attempts=1,
+                            reasons=[],
+                            raw_audio=c_audio.copy(),
+                        )
                     return idx, res, c_audio
                 except Exception:
                     pass
@@ -415,17 +440,39 @@ class PipelineOrchestrator:
             if audio_48k is not None:
                 try:
                     sf.write(str(cached_wav), audio_48k, 48000)
+                    cached_meta.write_text(
+                        json.dumps({
+                            "content_hash": seg_hash,
+                            "res": res.model_dump(exclude={"raw_audio"}),
+                        }, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
                 except Exception:
                     pass
-            self.manifest.record_completed_segment(lang, seg.segment_id)
+            self.manifest.record_completed_segment(lang, seg.segment_id, content_hash=seg_hash)
             return idx, res, audio_48k
 
-        # C3: Parallel segment synthesis bounded by settings.semaphore_tts in bodhan_client
-        fit_tasks = [
-            _fit_single_segment(i, seg, tr_info, segment_voices[i])
-            for i, (seg, tr_info) in enumerate(zip(english_segments, translations))
-        ]
-        fit_raw_results = await asyncio.gather(*fit_tasks, return_exceptions=True)
+        # B7: Warm up CPSCalibrator with first N=3 segments before predicting remaining
+        fit_raw_results: List[Any] = [None] * len(english_segments)
+        warmup_n = min(3, len(english_segments))
+        for i in range(warmup_n):
+            seg = english_segments[i]
+            tr_info = translations[i]
+            v = segment_voices[i]
+            try:
+                fit_raw_results[i] = await _fit_single_segment(i, seg, tr_info, v)
+            except Exception as e:
+                fit_raw_results[i] = e
+
+        # Remaining segments synthesize in parallel with warmed-up calibration
+        if len(english_segments) > warmup_n:
+            rem_tasks = [
+                _fit_single_segment(i, english_segments[i], translations[i], segment_voices[i])
+                for i in range(warmup_n, len(english_segments))
+            ]
+            rem_results = await asyncio.gather(*rem_tasks, return_exceptions=True)
+            for idx_offset, res in enumerate(rem_results):
+                fit_raw_results[warmup_n + idx_offset] = res
 
         fit_results = []
         audio_buffers = []
@@ -484,12 +531,23 @@ class PipelineOrchestrator:
 
         # 4. Audio Mixer
         speech_intervals_to_mute: List[Tuple[float, float]] = []
+        placed_spans: List[Tuple[float, float]] = []
+        skipped_spans: List[Tuple[float, float]] = []
+
+        # Add all detected source speech regions from VAD
+        for r in vad_result.speech_regions:
+            speech_intervals_to_mute.append((r.start, r.end))
+
         for seg, sched_seg in zip(english_segments, sched_res.segments):
-            if not sched_seg.is_skipped:
+            if sched_seg.is_skipped:
+                skipped_spans.append((seg.start, seg.end))
+            else:
                 speech_intervals_to_mute.append((seg.start, seg.end))
+                placed_spans.append((sched_seg.placed_start, sched_seg.placed_end))
 
         dubbed_wav_path = self.work_dir / f"dubbed_{lang}.wav"
-        integrated_lufs = mix_dubbed_audio(
+        integrated_lufs = await asyncio.to_thread(
+            mix_dubbed_audio,
             original_audio_path=audio_orig_path,
             speech_stem_48k=speech_stem_48k,
             speech_intervals_to_mute=speech_intervals_to_mute,
@@ -497,19 +555,11 @@ class PipelineOrchestrator:
             target_lufs=-16.0,
             sample_rate=48000,
             separate_music_vocal_path=self.separate_music_vocal_path,
+            placed_spans=placed_spans,
+            skipped_spans=skipped_spans,
         )
 
-        # 5. Video Muxer
-        target_mp4_path = lang_out_dir / f"video.{lang}.mp4"
-        mux_res = mux_and_verify(
-            video_path=video_path,
-            audio_path=dubbed_wav_path,
-            output_mp4_path=target_mp4_path,
-            lang=lang,
-            logger=self.logger,
-        )
-
-        # 6. Subtitles and Segments Output
+        # 5. Subtitles and Segments Output (B12: write before mux)
         segments_json_data = []
         for seg, fit_res, sched_seg in zip(english_segments, fit_results, sched_res.segments):
             segments_json_data.append({
@@ -533,6 +583,28 @@ class PipelineOrchestrator:
             srt_path=lang_out_dir / f"subtitles.{lang}.srt",
             vtt_path=lang_out_dir / f"subtitles.{lang}.vtt",
         )
+
+        # 6. Video Muxer
+        target_mp4_path = lang_out_dir / f"video.{lang}.mp4"
+        try:
+            mux_res = mux_and_verify(
+                video_path=video_path,
+                audio_path=dubbed_wav_path,
+                output_mp4_path=target_mp4_path,
+                lang=lang,
+                logger=self.logger,
+            )
+        except Exception as e:
+            self.logger.error(f"Mux verification failed for '{lang}': {e}", stage="mux", lang=lang)
+            lang_errors.append(f"Mux failed: {e}")
+            mux_res = MuxResult(
+                output_path=str(target_mp4_path),
+                video_duration_s=0.0,
+                audio_duration_s=0.0,
+                duration_delta_ms=0.0,
+                verified=False,
+                error=str(e),
+            )
 
         # Compute summary statistics
         stretches = [s.speed_factor for s in sched_res.segments if not s.is_skipped]
@@ -584,6 +656,8 @@ class PipelineOrchestrator:
                 "p95": float(np.percentile(cers, 95)) if cers else 0.0,
             },
             integrated_lufs=round(integrated_lufs, 2),
+            stem_lufs=round(measure_loudness(speech_stem_48k, 48000), 2) if np.max(np.abs(speech_stem_48k)) > 1e-4 else -70.0,
+            true_peak_dbtp=mux_res.measured_tp_dbtp,
             duration_delta_ms=round(mux_res.duration_delta_ms, 1),
             retries_count=retries_count,
             errors=lang_errors,
@@ -622,8 +696,42 @@ class PipelineOrchestrator:
 
         # 1. Run Shared Stages
         t0 = time.time()
-        vad_res, english_segments, audio_orig_path, glossary = await self.run_shared_stages(video_path, target_langs)
-        stage_timings["shared_stages"] = time.time() - t0
+        try:
+            vad_res, english_segments, audio_orig_path, glossary = await self.run_shared_stages(video_path, target_langs)
+            stage_timings["shared_stages"] = time.time() - t0
+        except (BudgetExceededError, CircuitBreakerOpen) as e:
+            self.logger.error(f"Shared stages stopped due to fatal condition: {e}", stage="pipeline")
+            lang_summaries = {}
+            for lang in target_langs:
+                lang_dir = self.out_dir / lang
+                lang_dir.mkdir(parents=True, exist_ok=True)
+                write_target_segments_json([], lang_dir / f"segments.{lang}.json")
+                write_target_subtitles([], lang_dir / f"subtitles.{lang}.srt", lang_dir / f"subtitles.{lang}.vtt")
+                lang_summaries[lang] = LanguageSummary(
+                    status="failed",
+                    total_segments=0,
+                    placed_segments=0,
+                    degraded_segments=0,
+                    skipped_segments=0,
+                    flagged_segments=0,
+                    overrun_segments=0,
+                    integrated_lufs=-70.0,
+                    duration_delta_ms=0.0,
+                    retries_count=0,
+                    errors=[f"Shared stages failed: {type(e).__name__}: {e}"],
+                )
+            report = build_pipeline_report(
+                run_id=self.manifest.run_id,
+                input_file=str(video_path),
+                video_duration_s=0.0,
+                lang_summaries=lang_summaries,
+                cost_ledger=self.ledger,
+                stage_timings=stage_timings,
+            )
+            report.save(self.out_dir / "report.json")
+            self.manifest.save(self.out_dir / "manifest.json")
+            self.logger.save_log(self.out_dir / "run.log.jsonl")
+            return 1
 
         # Handle silent / music-only video (ok_no_speech)
         if not vad_res.has_speech:
@@ -676,35 +784,21 @@ class PipelineOrchestrator:
             self.logger.save_log(self.out_dir / "run.log.jsonl")
             return 0
 
-        # Handle case where VAD found speech but zero segments survived ASR filtering
+        # B1: Handle case where VAD found speech but zero segments survived ASR filtering
         if len(english_segments) == 0:
-            self.logger.warning(
-                "VAD detected speech regions, but zero segments survived ASR filtering and hallucination checks!",
+            self.logger.error(
+                "VAD detected speech regions, but zero segments survived ASR filtering! "
+                "Refusing to produce English passthrough labelled as dubbed.",
                 stage="pipeline",
             )
             lang_summaries = {}
             for lang in target_langs:
                 lang_dir = self.out_dir / lang
                 lang_dir.mkdir(parents=True, exist_ok=True)
-                target_video = lang_dir / f"video.{lang}.mp4"
-
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(video_path),
-                    "-c", "copy",
-                    "-metadata", "comment=AI-dubbed with Bodhan Indic-Speak",
-                    "-metadata", "title=AI-dubbed with Bodhan Indic-Speak",
-                    "-movflags", "+faststart",
-                    str(target_video),
-                ]
-                res = subprocess.run(cmd, capture_output=True)
-                if res.returncode != 0 or not target_video.exists():
-                    shutil.copy2(video_path, target_video)
-
                 write_target_segments_json([], lang_dir / f"segments.{lang}.json")
                 write_target_subtitles([], lang_dir / f"subtitles.{lang}.srt", lang_dir / f"subtitles.{lang}.vtt")
                 lang_summaries[lang] = LanguageSummary(
-                    status="degraded",
+                    status="failed",
                     total_segments=0,
                     placed_segments=0,
                     degraded_segments=0,
@@ -714,7 +808,7 @@ class PipelineOrchestrator:
                     integrated_lufs=-70.0,
                     duration_delta_ms=0.0,
                     retries_count=0,
-                    errors=["VAD found speech but zero segments survived ASR filtering"],
+                    errors=["VAD found speech but zero segments survived ASR filtering (asr_failed)"],
                 )
 
             report = build_pipeline_report(
@@ -728,7 +822,7 @@ class PipelineOrchestrator:
             report.save(self.out_dir / "report.json")
             self.manifest.save(self.out_dir / "manifest.json")
             self.logger.save_log(self.out_dir / "run.log.jsonl")
-            return 0
+            return 1
 
         # 2. Per-Language Parallel Fork with Concurrency Semaphore (C3)
         t_lang_start = time.time()

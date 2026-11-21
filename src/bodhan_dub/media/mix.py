@@ -7,13 +7,77 @@ and normalizes to -16 LUFS integrated.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+import scipy.signal
 import soundfile as sf
 
-from bodhan_dub.media.loudness import apply_true_peak_limiter, normalize_to_target_lufs
+from bodhan_dub.media.loudness import (
+    apply_true_peak_limiter,
+    measure_loudness,
+    normalize_to_target_lufs,
+)
+
+
+def compute_union_mute_intervals(
+    source_speech_spans: List[Tuple[float, float]],
+    placed_spans: Optional[List[Tuple[float, float]]] = None,
+    skipped_spans: Optional[List[Tuple[float, float]]] = None,
+) -> List[Tuple[float, float]]:
+    """
+    B11: Computes the mute mask intervals:
+    - Union of detected source speech regions and placed dubbed segment spans
+    - Removes explicitly skipped segment intervals so original audio is preserved
+    - Merges overlapping or adjacent mute spans
+    """
+    all_spans: List[Tuple[float, float]] = []
+    for s, e in source_speech_spans:
+        if e > s:
+            all_spans.append((round(float(s), 3), round(float(e), 3)))
+    if placed_spans:
+        for s, e in placed_spans:
+            if e > s:
+                all_spans.append((round(float(s), 3), round(float(e), 3)))
+
+    if not all_spans:
+        return []
+
+    # Sort by start time
+    all_spans.sort(key=lambda x: x[0])
+
+    # Merge overlapping/contiguous intervals
+    merged: List[Tuple[float, float]] = []
+    curr_s, curr_e = all_spans[0]
+    for s, e in all_spans[1:]:
+        if s <= curr_e:
+            curr_e = max(curr_e, e)
+        else:
+            merged.append((curr_s, curr_e))
+            curr_s, curr_e = s, e
+    merged.append((curr_s, curr_e))
+
+    # Subtract skipped spans (un-mute original audio for skipped slots)
+    if skipped_spans:
+        for skip_s, skip_e in skipped_spans:
+            if skip_e <= skip_s:
+                continue
+            new_merged: List[Tuple[float, float]] = []
+            for m_s, m_e in merged:
+                if skip_e <= m_s or skip_s >= m_e:
+                    # No overlap
+                    new_merged.append((m_s, m_e))
+                else:
+                    # Overlap: punch a hole in the mute interval
+                    if m_s < skip_s:
+                        new_merged.append((m_s, skip_s))
+                    if m_e > skip_e:
+                        new_merged.append((skip_e, m_e))
+            merged = new_merged
+
+    return merged
 
 
 def mute_intervals_with_crossfade(
@@ -80,10 +144,13 @@ def mix_dubbed_audio(
     target_lufs: float = -16.0,
     sample_rate: int = 48000,
     separate_music_vocal_path: Optional[Path] = None,
+    placed_spans: Optional[List[Tuple[float, float]]] = None,
+    skipped_spans: Optional[List[Tuple[float, float]]] = None,
 ) -> float:
     """
-    Mutes original speech, mixes dubbed speech stem, normalizes loudness to -16 LUFS,
-    and writes the final audio WAV.
+    B3 & B11: Mutes original speech and placed spans, mixes dubbed speech stem,
+    normalizes loudness to -16 LUFS (±1) with true-peak ceiling (-1 dBTP),
+    and writes final 48kHz audio WAV.
     Returns final integrated LUFS.
     """
     output_wav_path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,53 +166,114 @@ def mix_dubbed_audio(
     total_samples = len(orig_data)
 
     # Match stem length to original audio length
-    if len(speech_stem_48k) < total_samples:
-        pad_len = total_samples - len(speech_stem_48k)
-        speech_stem_48k = np.pad(speech_stem_48k, (0, pad_len), mode="constant")
-    elif len(speech_stem_48k) > total_samples:
-        speech_stem_48k = speech_stem_48k[:total_samples]
+    stem = speech_stem_48k.copy()
+    if len(stem) < total_samples:
+        pad_len = total_samples - len(stem)
+        stem = np.pad(stem, (0, pad_len), mode="constant")
+    elif len(stem) > total_samples:
+        stem = stem[:total_samples]
 
     # Pre-normalize the speech stem to -16 LUFS (±1) if non-silent
-    if np.max(np.abs(speech_stem_48k)) > 1e-4:
-        norm_stem, _ = normalize_to_target_lufs(speech_stem_48k, target_lufs=target_lufs, sample_rate=sample_rate)
-        speech_stem_48k = norm_stem
+    if np.max(np.abs(stem)) > 1e-4:
+        norm_stem, _ = normalize_to_target_lufs(stem, target_lufs=target_lufs, sample_rate=sample_rate)
+        stem = norm_stem
+
+    # B11: Compute union of source speech + placed spans, minus skipped spans
+    effective_mute_spans = compute_union_mute_intervals(
+        source_speech_spans=speech_intervals_to_mute,
+        placed_spans=placed_spans,
+        skipped_spans=skipped_spans,
+    )
 
     # 2. Mute speech intervals in original audio (or vocal stem if separated)
     if separate_music_vocal_path and Path(separate_music_vocal_path).exists():
-        vocal_data, _ = sf.read(str(separate_music_vocal_path), dtype="float32")
-        # Duck only vocal stem, background instrumental remains unmuted
-        muted_vocal = mute_intervals_with_crossfade(
-            audio=vocal_data,
-            mute_spans=speech_intervals_to_mute,
-            sample_rate=sample_rate,
-            fade_ms=40.0,
-        )
-        muted_bg = orig_data - vocal_data + muted_vocal
+        try:
+            vocal_data, vocal_sr = sf.read(str(separate_music_vocal_path), dtype="float32")
+            # Resample vocal data if sample rate differs
+            if vocal_sr != sample_rate:
+                gcd = int(np.gcd(vocal_sr, sample_rate))
+                up = sample_rate // gcd
+                down = vocal_sr // gcd
+                if vocal_data.ndim == 1:
+                    vocal_data = scipy.signal.resample_poly(vocal_data, up, down).astype(np.float32)
+                else:
+                    vocal_data = scipy.signal.resample_poly(vocal_data, up, down, axis=0).astype(np.float32)
+
+            # Match channels
+            if is_stereo and vocal_data.ndim == 1:
+                vocal_data = np.column_stack([vocal_data, vocal_data])
+            elif not is_stereo and vocal_data.ndim > 1:
+                vocal_data = vocal_data[:, 0]
+
+            # Match sample length
+            if len(vocal_data) < total_samples:
+                vocal_data = np.pad(vocal_data, ((0, total_samples - len(vocal_data)), (0, 0)) if is_stereo else (0, total_samples - len(vocal_data)))
+            elif len(vocal_data) > total_samples:
+                vocal_data = vocal_data[:total_samples]
+
+            # Duck only vocal stem, background instrumental remains unmuted
+            muted_vocal = mute_intervals_with_crossfade(
+                audio=vocal_data,
+                mute_spans=effective_mute_spans,
+                sample_rate=sample_rate,
+                fade_ms=40.0,
+            )
+            muted_bg = orig_data - vocal_data + muted_vocal
+        except Exception:
+            # Fall back cleanly to full original audio ducking
+            muted_bg = mute_intervals_with_crossfade(
+                audio=orig_data,
+                mute_spans=effective_mute_spans,
+                sample_rate=sample_rate,
+                fade_ms=40.0,
+            )
     else:
         muted_bg = mute_intervals_with_crossfade(
             audio=orig_data,
-            mute_spans=speech_intervals_to_mute,
+            mute_spans=effective_mute_spans,
             sample_rate=sample_rate,
             fade_ms=40.0,
         )
 
     # 3. Sum speech stem with background
     if is_stereo:
-        dubbed_stereo = np.column_stack([speech_stem_48k, speech_stem_48k])
+        dubbed_stereo = np.column_stack([stem, stem])
         mixed = muted_bg[:, :2] + dubbed_stereo
     else:
         mono_bg = muted_bg[:, 0] if muted_bg.ndim > 1 else muted_bg
-        mixed = mono_bg + speech_stem_48k
+        mixed = mono_bg + stem
 
-    # 4. Final loudness normalization to -16 LUFS with true-peak limiter (ceiling -1.0 dBTP)
+    # 4. Multi-stage loudness normalization & limiting:
+    # Ensure -16 ± 1 LUFS and peak <= -1.0 dBTP
     normalized, final_lufs = normalize_to_target_lufs(
         mixed,
         target_lufs=target_lufs,
         sample_rate=sample_rate,
     )
-    limited = apply_true_peak_limiter(normalized, max_peak_dbtp=-1.0)
+    limited = apply_true_peak_limiter(normalized, max_peak_dbtp=-1.0, sample_rate=sample_rate)
 
-    # 5. Write to output WAV (48kHz float32/PCM_16)
+    # 5. Measure and adjust up to 3 times if outside [-17, -15] LUFS
+    curr_lufs = measure_loudness(limited, sample_rate)
+    for _ in range(3):
+        if -17.0 <= curr_lufs <= -15.0 or curr_lufs <= -60.0:
+            break
+        delta_db = target_lufs - curr_lufs
+        limited = apply_true_peak_limiter(
+            limited * (10.0 ** (np.clip(delta_db, -6.0, 6.0) / 20.0)),
+            max_peak_dbtp=-1.0,
+            sample_rate=sample_rate,
+        )
+        curr_lufs = measure_loudness(limited, sample_rate)
+
+    final_lufs = curr_lufs
+
+    # 6. Write to output WAV (48kHz float32/PCM_16)
     sf.write(str(output_wav_path), limited, sample_rate, subtype="PCM_16")
 
-    return final_lufs
+    return round(final_lufs, 2)
+
+
+async def async_mix_dubbed_audio(*args, **kwargs) -> float:
+    """B8: Offloads mixing, muting, and file I/O to a background thread."""
+    return await asyncio.to_thread(mix_dubbed_audio, *args, **kwargs)
+

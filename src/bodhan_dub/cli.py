@@ -270,17 +270,37 @@ async def async_main(
 
 
 def main() -> None:
-    """Synchronous CLI wrapper handling argument parsing and POSIX/Windows signals."""
+    """
+    B9 & B20: Synchronous CLI wrapper handling argument parsing, exact exit codes,
+    and POSIX/Windows signal trapping (canceling tasks, flushing state, exit 130).
+    """
+    import signal
+
     parser = build_parser()
     args = parser.parse_args()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    def _cancel_all_tasks():
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+
+    # Install cross-platform interrupt handlers
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _cancel_all_tasks)
+            except NotImplementedError:
+                signal.signal(sig, lambda _s, _f: _cancel_all_tasks())
+    else:
+        signal.signal(signal.SIGINT, lambda _s, _f: _cancel_all_tasks())
+        signal.signal(signal.SIGTERM, lambda _s, _f: _cancel_all_tasks())
+
     try:
         exit_code = loop.run_until_complete(async_main(args))
         sys.exit(exit_code)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         print(
             "\n[INFO] Interrupted by user (SIGINT). Flushed partial manifest and report.",
             file=sys.stderr,
