@@ -24,6 +24,7 @@ class LanguageInfo(BaseModel):
     tts_voices: Optional[VoiceConfig] = None
     code_mixed_target: Optional[str] = None
     unicode_range: Optional[List[int]] = None
+    cps_hint: Optional[Any] = None
 
 
 class LanguageRegistry:

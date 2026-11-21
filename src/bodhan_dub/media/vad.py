@@ -6,6 +6,8 @@ Fallback engine: ffmpeg silencedetect filter.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 import subprocess
 from dataclasses import dataclass
@@ -14,6 +16,10 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
+
+from bodhan_dub.config import SILERO_VAD_PINNED_SHA256
+
+logger = logging.getLogger("bodhan_dub.vad")
 
 
 @dataclass
@@ -139,16 +145,17 @@ class SileroVADDetector:
         self._try_load_model()
 
     def _try_load_model(self) -> None:
-        """Attempts to load Silero VAD onnx session."""
+        """Attempts to load Silero VAD onnx session with SHA256 integrity verification."""
         try:
             import onnxruntime as ort
 
-            # Check paths for silero_vad.onnx
+            # C5: Look for silero_vad.onnx in: explicit path, assets/models/, package directory, current directory
             candidates = [
                 self.model_path,
-                Path("silero_vad.onnx"),
+                Path("assets/models/silero_vad.onnx"),
+                Path(__file__).resolve().parent.parent / "assets" / "models" / "silero_vad.onnx",
                 Path(__file__).resolve().parent.parent.parent / "silero_vad.onnx",
-                Path.home() / ".cache" / "silero_vad" / "silero_vad.onnx",
+                Path("silero_vad.onnx"),
             ]
             valid_path = None
             for c in candidates:
@@ -156,14 +163,41 @@ class SileroVADDetector:
                     valid_path = Path(c)
                     break
 
-            if valid_path:
-                opts = ort.SessionOptions()
-                opts.inter_op_num_threads = 1
-                opts.intra_op_num_threads = 1
-                self._session = ort.InferenceSession(
-                    str(valid_path), opts, providers=["CPUExecutionProvider"]
+            if not valid_path:
+                logger.info("Silero VAD model not found in standard asset paths. Using ffmpeg silencedetect fallback.")
+                self._session = None
+                return
+
+            # Verify SHA256 integrity
+            try:
+                with open(valid_path, "rb") as f:
+                    file_hash = hashlib.sha256(f.read()).hexdigest()
+                if file_hash != SILERO_VAD_PINNED_SHA256:
+                    logger.warning(
+                        f"Silero VAD model at '{valid_path}' failed SHA256 integrity check "
+                        f"(expected {SILERO_VAD_PINNED_SHA256}, got {file_hash}). "
+                        "Falling back cleanly to ffmpeg silencedetect."
+                    )
+                    self._session = None
+                    return
+            except Exception as e:
+                logger.warning(
+                    f"Error checking Silero VAD integrity at '{valid_path}': {e}. "
+                    "Falling back cleanly to ffmpeg silencedetect."
                 )
-        except Exception:
+                self._session = None
+                return
+
+            opts = ort.SessionOptions()
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = 1
+            self._session = ort.InferenceSession(
+                str(valid_path), opts, providers=["CPUExecutionProvider"]
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to initialize onnxruntime session for Silero VAD: {e}. Falling back cleanly to ffmpeg."
+            )
             self._session = None
 
     def process(

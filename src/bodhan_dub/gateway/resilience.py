@@ -57,6 +57,24 @@ class CircuitBreaker:
                 )
 
 
+class CircuitBreakerRegistry:
+    """Manages isolated circuit breakers per (service, language) tuple."""
+
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._breakers: dict[tuple[str, str], CircuitBreaker] = {}
+
+    def get_breaker(self, service: str, lang: str = "default") -> CircuitBreaker:
+        key = (service.lower(), lang.lower())
+        if key not in self._breakers:
+            self._breakers[key] = CircuitBreaker(
+                failure_threshold=self.failure_threshold,
+                recovery_timeout=self.recovery_timeout,
+            )
+        return self._breakers[key]
+
+
 def should_retry_exception(exc: BaseException) -> bool:
     """Retry on network timeouts, connection errors, and 429/5xx status codes."""
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)):
@@ -79,46 +97,56 @@ async def execute_with_resilience(
     """
     Executes an async HTTP request within a concurrency semaphore, guarded by
     circuit breaker and retried with backoff and Retry-After awareness.
+    Releases semaphore while sleeping on 429/5xx to prevent slot starvation.
     """
     if circuit_breaker:
         circuit_breaker.check_state()
 
-    async with semaphore:
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(max_attempts),
-            wait=wait_exponential_jitter(initial=min_wait, max=max_wait, jitter=1.0),
-            retry=retry_if_exception(should_retry_exception),
-            reraise=True,
-        ):
-            with attempt:
-                try:
+    async for attempt in AsyncRetrying(
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_exponential_jitter(initial=min_wait, max=max_wait, jitter=1.0),
+        retry=retry_if_exception(should_retry_exception),
+        reraise=True,
+    ):
+        with attempt:
+            try:
+                if circuit_breaker:
+                    circuit_breaker.check_state()
+
+                # C2: Acquire semaphore ONLY during network execution, releasing it before sleep
+                async with semaphore:
                     resp = await coro_fn()
-                    # Check for 429 / 5xx to trigger retry
-                    if resp.status_code == 429:
-                        retry_after_str = resp.headers.get("Retry-After")
-                        wait_sec = (
-                            float(retry_after_str)
-                            if retry_after_str
-                            else (1.5**attempt.retry_state.attempt_number)
-                        )
-                        # Add slight jitter
-                        wait_sec += random.uniform(0.1, 0.5)
-                        await asyncio.sleep(wait_sec)
-                        resp.raise_for_status()
 
-                    elif resp.status_code >= 500:
-                        if circuit_breaker:
-                            circuit_breaker.record_failure(resp.status_code)
-                        resp.raise_for_status()
+                # Check for 429 / 5xx to trigger retry
+                if resp.status_code == 429:
+                    retry_after_str = resp.headers.get("Retry-After")
+                    wait_sec = (
+                        float(retry_after_str)
+                        if retry_after_str
+                        else (1.5**attempt.retry_state.attempt_number)
+                    )
+                    wait_sec += random.uniform(0.1, 0.5)
+                    # Semaphore is released before sleeping!
+                    await asyncio.sleep(wait_sec)
+                    if resp._request is None:
+                        resp._request = httpx.Request("POST", "https://api.bodhan.ai")
+                    resp.raise_for_status()
 
-                    # Success (2xx or 4xx other than 429)
-                    if circuit_breaker and resp.status_code < 400:
-                        circuit_breaker.record_success()
-                    return resp
+                elif resp.status_code >= 500:
+                    if circuit_breaker:
+                        circuit_breaker.record_failure(resp.status_code)
+                    if resp._request is None:
+                        resp._request = httpx.Request("POST", "https://api.bodhan.ai")
+                    resp.raise_for_status()
 
-                except httpx.HTTPStatusError as e:
-                    if circuit_breaker and e.response.status_code >= 500:
-                        circuit_breaker.record_failure(e.response.status_code)
-                    raise
+                # Success (2xx or 4xx other than 429)
+                if circuit_breaker and resp.status_code < 400:
+                    circuit_breaker.record_success()
+                return resp
 
-        raise RuntimeError("Retry loop exited without response or exception")
+            except httpx.HTTPStatusError as e:
+                if circuit_breaker and e.response.status_code >= 500:
+                    circuit_breaker.record_failure(e.response.status_code)
+                raise
+
+    raise RuntimeError("Retry loop exited without response or exception")

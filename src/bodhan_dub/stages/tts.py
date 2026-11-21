@@ -5,6 +5,7 @@ and stitches audio with crossfades and edge silence trimming.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 from statistics import median
 from typing import Dict, List, Optional, Tuple
@@ -23,22 +24,18 @@ from bodhan_dub.media.audio_proc import (
 
 
 class CPSCalibrator:
-    """Tracks running median characters-per-second per (lang, voice)."""
+    """Tracks running median and EWMA characters-per-second per (lang, voice)."""
 
-    def __init__(self):
-        # Initial calibration seeds from Phase 0 live measurements
-        self.history: Dict[Tuple[str, str], List[float]] = {
-            ("hi", "Kavya"): [11.37],
-            ("hi", "Amit"): [13.50],
-            ("bn", "Ishita"): [11.20],
-            ("bn", "Sourav"): [13.80],
-            ("ta", "Kavya"): [11.50],
-            ("te", "Kavya"): [12.00],
-        }
-        self.default_cps = 12.0
+    def __init__(self, default_cps: float = 12.0):
+        # B4: Initial calibration seeds emptied per spec; all start at single calibrated default
+        self.history: Dict[Tuple[str, str], List[float]] = {}
+        self.ewma: Dict[Tuple[str, str], float] = {}
+        self.default_cps = default_cps
+        # C3: asyncio.Lock for atomic updates across concurrent synthesis tasks
+        self.lock = asyncio.Lock()
 
     def get_cps(self, lang: str, voice: str) -> float:
-        """Returns running median CPS for given voice profile."""
+        """Returns running median or EWMA CPS for given voice profile."""
         key = (lang, voice)
         if key in self.history and self.history[key]:
             return float(median(self.history[key]))
@@ -64,6 +61,12 @@ class CPSCalibrator:
             # Keep last 15 observations for running window
             if len(self.history[key]) > 15:
                 self.history[key].pop(0)
+
+            # EWMA with alpha=0.3
+            if key not in self.ewma:
+                self.ewma[key] = cps
+            else:
+                self.ewma[key] = round(0.3 * cps + 0.7 * self.ewma[key], 2)
 
     def predict_duration(self, text: str, lang: str, voice: str) -> float:
         """Predicts audio duration before calling synthesis API."""
@@ -122,6 +125,8 @@ class TTSSynthesizer:
         lang: str,
         voice: str,
         segment_id: str,
+        nonce: Optional[int] = None,
+        max_chars: int = 180,
     ) -> Tuple[np.ndarray, float, float]:
         """
         Synthesizes text into 48 kHz mono float32 audio.
@@ -129,20 +134,32 @@ class TTSSynthesizer:
         """
         predicted_dur = self.calibrator.predict_duration(text, lang, voice)
 
-        # Split into <=180 character chunks at punctuation
-        pieces = split_text_at_punctuation(text, max_chars=180)
+        # Split into <=max_chars character chunks at punctuation
+        pieces = split_text_at_punctuation(text, max_chars=max_chars)
 
         audio_pieces: List[np.ndarray] = []
         for idx, piece in enumerate(pieces):
             piece_id = f"{segment_id}_p{idx}" if len(pieces) > 1 else segment_id
-            raw_wav_bytes = await self.bodhan_client.speak(
-                text=piece,
-                voice=voice,
-                language_code=lang,
-                stage="tts",
-                lang=lang,
-                segment_id=piece_id,
-            )
+            speak_kwargs = {"stage": "tts", "lang": lang, "segment_id": piece_id}
+            if nonce is not None:
+                speak_kwargs["nonce"] = nonce
+
+            try:
+                raw_wav_bytes = await self.bodhan_client.speak(
+                    text=piece,
+                    voice=voice,
+                    language_code=lang,
+                    **speak_kwargs,
+                )
+            except TypeError:
+                raw_wav_bytes = await self.bodhan_client.speak(
+                    text=piece,
+                    voice=voice,
+                    language_code=lang,
+                    stage="tts",
+                    lang=lang,
+                    segment_id=piece_id,
+                )
 
             # Read 24kHz audio from bytes
             with io.BytesIO(raw_wav_bytes) as buf:
@@ -162,8 +179,9 @@ class TTSSynthesizer:
         audio_48k = resample_24k_to_48k(stitched_24k)
         actual_dur = len(audio_48k) / 48000.0
 
-        # Update calibration history
-        self.calibrator.record_measurement(lang, voice, len(text), actual_dur)
+        # Update calibration history with lock
+        async with self.calibrator.lock:
+            self.calibrator.record_measurement(lang, voice, len(text), actual_dur)
 
         return audio_48k, actual_dur, predicted_dur
 

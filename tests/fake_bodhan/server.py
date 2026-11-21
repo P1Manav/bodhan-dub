@@ -114,10 +114,21 @@ class FakeBodhanTransport(httpx.AsyncBaseTransport):
             body_json = json.loads(request.content.decode("utf-8"))
             model = body_json.get("model", "")
 
+            # Fault injection for translate
+            if self.failure_injection.get("translate_500"):
+                return httpx.Response(
+                    500, json={"error": {"message": "Injected translate 500", "code": "server_error"}}
+                )
+
             # Check if this is an LLM mock or Bodhan Translate mock
             if model == "indic-translate":
                 target_lang = body_json.get("target_language_code", "hi")
                 user_msg = body_json["messages"][0]["content"]
+
+                if self.failure_injection.get("wrong_script_translation"):
+                    translated = "यह गलत लिपि का पाठ है।"
+                else:
+                    translated = None
 
                 # Canned Indic translations
                 mock_translations = {
@@ -135,9 +146,10 @@ class FakeBodhanTransport(httpx.AsyncBaseTransport):
                     "ur": "مصنوعی ذہانت کے تعارف میں خوش آمدید۔",
                     "en": "Welcome to the introduction to artificial intelligence.",
                 }
-                translated = mock_translations.get(
-                    target_lang, f"[{target_lang} translated]: {user_msg}"
-                )
+                if translated is None:
+                    translated = mock_translations.get(
+                        target_lang, f"[{target_lang} translated]: {user_msg}"
+                    )
 
                 resp_data = {
                     "id": f"chatcmpl-mock-{self.call_counts['translate']}",
@@ -161,7 +173,11 @@ class FakeBodhanTransport(httpx.AsyncBaseTransport):
 
             # Intelligent fallback for LLM chat completions
             prompt_str = str(body_json)
-            if "verdict" in prompt_str.lower():
+            if "retry_planner" in prompt_str.lower() or "chosen_action" in prompt_str.lower() or "retry policy" in prompt_str.lower():
+                content = json.dumps({"action": "split_text", "reason": "Mock planner selected split_text"})
+            elif "terms" in prompt_str.lower() and "terminology" in prompt_str.lower():
+                content = json.dumps({"terms": ["artificial intelligence", "AI"]})
+            elif "verdict" in prompt_str.lower():
                 content = json.dumps({"verdict": "ok", "evidence": "Verified accurate by mock"})
             elif "condensed_en" in prompt_str:
                 content = json.dumps({"condensed_en": "Welcome to AI."})
@@ -184,6 +200,21 @@ class FakeBodhanTransport(httpx.AsyncBaseTransport):
         elif "/audio/speech" in path:
             self.call_counts["speak"] += 1
             body_json = json.loads(request.content.decode("utf-8"))
+            instructions = body_json.get("instructions", "{}")
+            try:
+                inst_dict = json.loads(instructions) if isinstance(instructions, str) else instructions
+                lang = inst_dict.get("lang", "")
+            except Exception:
+                lang = ""
+
+            if self.failure_injection.get("speak_500") or (
+                lang and lang in self.failure_injection.get("speak_500_langs", [])
+            ):
+                return httpx.Response(
+                    500,
+                    json={"error": {"message": f"Injected speak 500 for {lang}", "code": "server_error"}},
+                )
+
             text = body_json.get("input", "")
             # Estimate audio duration roughly from char count
             duration_s = max(1.0, len(text) / 12.0)

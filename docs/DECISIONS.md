@@ -59,3 +59,62 @@ This log records design decisions made during development of `bodhan_dub`, follo
 ### [2026-11-18] DEC-014: AI-Dubbed Metadata and Output Verification
 - **Decision:** Multiplex video and dubbed audio into MP4 with `-movflags +faststart`, MP4 comment metadata `"AI-dubbed with Bodhan Indic-Speak"`, and ISO audio track language tags. Verify via ffprobe that audio and video stream durations match within ±100ms, triggering bounded padding or trimming repair (max 2 attempts) if drift is detected.
 - **Reason:** Transparent AI labeling per ethical standards and seamless playback across web browsers and media players without desync.
+
+### [2026-11-21] DEC-015: Post-synthesis Condensation Loop and Entity Preservation Guard
+- **Decision:** When synthesized speech duration exceeds `1.20 * slot_duration`, execute up to 2 post-synthesis English condensation attempts with an LLM character budget calculated from `slot_duration * calibrator.get_cps(lang, voice)`. Require that numbers, acronyms, capitalized names, and glossary terms are deterministically verified in the condensed output. Re-translate with Indic-Translate, re-synthesize, and keep the best candidate by CER then fit ratio.
+- **Reason:** Resolves syllable expansion before relying on slack borrowing and time stretching, preventing unnatural speech rates while guaranteeing factual accuracy and entity preservation.
+
+### [2026-11-21] DEC-016: Non-cascading Sync Budget Placement with Lookahead
+- **Decision:** Timeline placement computes start times in a single pass with lookahead. If a segment exceeds its slot, borrow following slack and stretch up to 1.20x; if still overflowing, flag `overrun` and accept local drift rather than cascading desync onto downstream segments. At media boundary, shift earlier up to 250ms; if speech still exceeds file duration, flag `truncation_risk` and degrade segment without silently truncating audio.
+- **Reason:** Prevents desync propagation across multi-minute videos and ensures speech is never dropped or silently cut.
+
+### [2026-11-21] DEC-017: Multi-factor Speech QA Gating with Configurable Thresholds
+- **Decision:** Expand QA gating to fail segments exhibiting internal silence >1.5s or duration-vs-prediction outside [0.6, 1.6]. Make CER thresholds configurable (`cer_warn=0.15`, `cer_fail=0.30`, `cer_degraded_max=0.45`). When strict QA fails on all 3 attempts, retain the candidate with lowest CER and mark `degraded` if CER ≤ `cer_degraded_max`, or `skipped` if above.
+- **Reason:** Keeps the pipeline honest and resilient: partial phonetic degradation is accepted with clear reporting, while severe acoustic flaws or speech dropouts are skipped to preserve original audio.
+
+### [2026-11-21] DEC-018: Voice-Agnostic Dynamic CPS Calibration
+- **Decision:** Remove all hard-coded language/voice seeds from `CPSCalibrator`. Initialize unmeasured voices at generic default (12.0 cps) or from `languages.yaml` hints, and update running history and EWMA (`alpha=0.3`) dynamically after each synthesized segment.
+- **Reason:** Eliminates bias, supports arbitrary voices or languages, and smoothly converges to actual speech rates.
+
+### [2026-11-21] DEC-019: Polyphase True-Peak Limiting and Equal-Power Ducking
+- **Decision:** Implement 4x polyphase oversampling via `scipy.signal.resample_poly` to detect and clamp inter-sample true peaks to -1.0 dBTP. Apply 40ms equal-power (`cos`/`sin`) gain crossfades to duck original speech regions while leaving skipped slots completely unmuted.
+- **Reason:** Prevents digital clipping distortion upon lossy AAC encoding and preserves broadcast loudness compliance (-16.0 ± 1.0 LUFS) with seamless ambient continuity.
+
+### [2026-11-21] DEC-020: Format-Preserving Video Muxing with Duration Lock
+- **Decision:** Ensure muxing passes `-t <input video duration>` to match input container length exactly, remove `-shortest`, write clean metadata without escaped inner quotes, handle non-zero input `start_time` with `-itsoffset`, and fall back to `-c:v libx264 -pix_fmt yuv420p` if stream copy fails. Enforce strict verification within ±100ms.
+- **Reason:** Eliminates audio/video drift across variable frame rate or rotated video files while preserving full format compatibility.
+
+### [2026-11-21] DEC-021: LLM Client Hardening and Prompt Injection Isolation (<data> wrapper & Host Allowlist)
+- **Decision:** All LLM requests are guarded by `HostAllowlistGuard` on outgoing traffic, failing fast in `__init__` on unauthorized hosts. Untrusted audio transcript text and user input are strictly wrapped in `<data>...</data>` with explicit system instructions prohibiting command execution. Implemented Decision Point #6 (`plan_retry_action`) choosing among enum `['split_text', 'paraphrase_source', 'condense', 'retry_same']` with deterministic fallback, and Decision Point #7 (`extract_glossary_terms`) with strict transcript substring validation, number/punctuation filtering, and length-descending sort.
+- **Reason:** Prevents prompt injection attacks embedded in video transcripts from hijacking LLM linguistic editing tasks, and ensures 100% deterministic reliability even if the LLM fails or is unavailable.
+
+### [2026-11-21] DEC-022: Isolated Circuit Breakers per (Service, Language) Tuple
+- **Decision:** Manage circuit breakers via `CircuitBreakerRegistry` holding isolated state per `(service, language)` tuple. Trips on 5 consecutive 5xx failures per service/language. In `execute_with_resilience`, the concurrency semaphore is released prior to sleeping on 429/5xx backoff.
+- **Reason:** An outage in Tamil TTS does not trip Hindi ASR or Telugu TTS, and releasing semaphores during backoff prevents slot starvation across concurrent tasks.
+
+### [2026-11-21] DEC-023: Full End-to-End Language and Segment Concurrency
+- **Decision:** Run per-language processing in parallel up to `--concurrency` (default 2), and parallelize per-language segment translation (bounded by `semaphore_translate`) and segment synthesis (bounded by `semaphore_tts`). Synchronize `CPSCalibrator` updates across concurrent synthesis tasks with `asyncio.Lock`.
+- **Reason:** Provides significant wall-clock speedup when dubbing into multiple languages while respecting server rate limits and eliminating race conditions.
+
+### [2026-11-21] DEC-024: CLI Operational Flags Wiring
+- **Decision:** Fully wire all operational flags through `cli.py` and `orchestrator.py`: `--concurrency` (default 2), `--voices` (custom YAML/JSON mapping `lang: voice`), `--resume` (checks `manifest.json` completed segments and intermediate WAVs to avoid redundant synthesis), `--separate-music` (checks for demucs/spleeter and falls back cleanly to VAD ducking if missing), and `--keep-work` (cleans up intermediate work dir on clean exit by default, retains if flag is set).
+- **Reason:** Provides full operator controllability, robust crash recovery, and seamless intermediate asset inspection.
+
+### [2026-11-21] DEC-025: Silero VAD Local Asset Integrity and Cryptographic Hash Check
+- **Decision:** Verify SHA256 of `silero_vad.onnx` against pinned hash `2ea52a1c618ec50428f5370d0b8b1a8d0f1b2123d47d953a99e71e74a80fb4ff` across explicit, asset, package, and root paths. If missing or corrupt, log a clear warning and fall back cleanly to ffmpeg `silencedetect` without crashing.
+- **Reason:** Protects against poisoned or corrupt ONNX models while ensuring zero crashes on bare environments.
+
+### [2026-11-21] DEC-026: Automatic Speaker Voice Pitch Clustering
+- **Decision:** When `--speaker-voices auto` is set, estimate fundamental frequency (F0) per speech segment via autocorrelation; cluster segments into male/female (or 2 clusters), and map clusters to male and female voices from `LanguageRegistry.get_default_voice`. Fallback to default voice if clustering fails or single speaker.
+- **Reason:** Supports multi-speaker videos with automatic vocal identity preservation without requiring external speaker diarization models.
+
+---
+
+## Folded Notes: Ingest, VAD, Chunking, ASR & Segmentation (Phase 2 Archive)
+- **Audio Extraction**: 16 kHz mono 16-bit PCM for ASR with `-avoid_negative_ts make_zero`; 48 kHz uncompressed WAV for mixing.
+- **VAD Dual Engine**: Silero-VAD ONNX with automatic ffmpeg `silencedetect` fallback; pause inversion logic for speech regions.
+- **Chunk Planning**: Target 25s, hard max ceiling 29s (under 30s Bodhan limit); pause midpoint splitting with energy fallback.
+- **ASR Verification**: Memory-efficient WAV slicing; bounded retry on empty text; overlap deduplication with rapidfuzz; hallucination filtering (<40% VAD overlap or repeated n-grams dropped).
+- **Sentence Segmenter**: Sentence boundary merging, clause splitting for segments >12s, tiny segment (<0.6s) merging, slot/slack calculation with 80ms guard band and 250ms max shift.
+- **English Subtitles**: Grapheme-safe wrapping (regex `\X`) for `transcript.en.json`, `subtitles.en.srt`, `subtitles.en.vtt`.
+

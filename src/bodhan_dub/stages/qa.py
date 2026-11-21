@@ -16,6 +16,8 @@ import soundfile as sf
 from pydantic import BaseModel, Field
 
 from bodhan_dub.gateway.bodhan import BodhanClient
+from bodhan_dub.gateway.cost import BudgetExceededError
+from bodhan_dub.gateway.resilience import CircuitBreakerOpen
 from bodhan_dub.logging import PipelineLogger
 from bodhan_dub.media.audio_proc import check_clipping, detect_internal_silence
 from bodhan_dub.text.cer import compute_cer, detect_tail_omission
@@ -118,6 +120,8 @@ class SpeechQA:
                 segment_id=segment_id,
             )
             hypothesis_text = resp.get("text", "").strip()
+        except (BudgetExceededError, CircuitBreakerOpen):
+            raise
         except Exception as e:
             self.logger.warning(
                 f"Back-transcription failed during QA: {e}",

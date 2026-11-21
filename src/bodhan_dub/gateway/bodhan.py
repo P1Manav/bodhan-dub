@@ -19,7 +19,11 @@ import httpx
 from bodhan_dub.config import Settings
 from bodhan_dub.gateway.cache import DiskCache
 from bodhan_dub.gateway.cost import BudgetGuard, CostLedger
-from bodhan_dub.gateway.resilience import CircuitBreaker, execute_with_resilience
+from bodhan_dub.gateway.resilience import (
+    CircuitBreaker,
+    CircuitBreakerRegistry,
+    execute_with_resilience,
+)
 from bodhan_dub.logging import PipelineLogger
 from bodhan_dub.policy import HostAllowlistGuard
 
@@ -47,10 +51,11 @@ class BodhanClient:
         self.sem_translate = asyncio.Semaphore(settings.semaphore_translate)
         self.sem_tts = asyncio.Semaphore(settings.semaphore_tts)
 
-        # Circuit breakers
-        self.cb_asr = CircuitBreaker(settings.circuit_breaker_threshold)
-        self.cb_translate = CircuitBreaker(settings.circuit_breaker_threshold)
-        self.cb_tts = CircuitBreaker(settings.circuit_breaker_threshold)
+        # Circuit breaker registry isolating per (service, language)
+        self.cb_registry = CircuitBreakerRegistry(
+            failure_threshold=settings.circuit_breaker_threshold,
+            recovery_timeout=60.0,
+        )
 
         # Policy guard for allowed hosts
         self.policy_guard = HostAllowlistGuard(
@@ -70,6 +75,18 @@ class BodhanClient:
 
     async def close(self) -> None:
         await self._http.aclose()
+
+    @property
+    def cb_asr(self) -> CircuitBreaker:
+        return self.cb_registry.get_breaker("transcribe", "default")
+
+    @property
+    def cb_translate(self) -> CircuitBreaker:
+        return self.cb_registry.get_breaker("translate", "default")
+
+    @property
+    def cb_tts(self) -> CircuitBreaker:
+        return self.cb_registry.get_breaker("speak", "default")
 
     # -----------------------------------------------------------------------
     # 1. Indic-Transcribe
@@ -126,10 +143,11 @@ class BodhanClient:
                 timeout=self.settings.timeout_asr,
             )
 
+        cb = self.cb_registry.get_breaker("transcribe", language or lang or "en")
         resp = await execute_with_resilience(
             _call,
             semaphore=self.sem_asr,
-            circuit_breaker=self.cb_asr,
+            circuit_breaker=cb,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -202,10 +220,11 @@ class BodhanClient:
                 timeout=self.settings.timeout_translate,
             )
 
+        cb = self.cb_registry.get_breaker("translate", target_language_code or "default")
         resp = await execute_with_resilience(
             _call,
             semaphore=self.sem_translate,
-            circuit_breaker=self.cb_translate,
+            circuit_breaker=cb,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -230,6 +249,7 @@ class BodhanClient:
         stage: str = "tts",
         lang: Optional[str] = None,
         segment_id: Optional[str] = None,
+        nonce: Optional[int] = None,
     ) -> bytes:
         """
         Synthesizes text into audio using Bodhan Indic-Speak.
@@ -242,7 +262,15 @@ class BodhanClient:
             inst_dict["style"] = style
         instructions_str = json.dumps(inst_dict)
 
-        params = {"voice": voice, "instructions": instructions_str}
+        params: Dict[str, Any] = {"voice": voice, "instructions": instructions_str}
+        if nonce is not None:
+            params["nonce"] = nonce
+            self.logger.info(
+                f"Deliberate retry_same requested with nonce={nonce} to bypass identical synthesis",
+                stage=stage,
+                lang=lang,
+                segment_id=segment_id,
+            )
 
         # Check Cache
         cache_key = self.cache.compute_key(service, model, params, text)
@@ -281,10 +309,11 @@ class BodhanClient:
                 timeout=self.settings.timeout_tts,
             )
 
+        cb = self.cb_registry.get_breaker("speak", language_code or lang or "default")
         resp = await execute_with_resilience(
             _call,
             semaphore=self.sem_tts,
-            circuit_breaker=self.cb_tts,
+            circuit_breaker=cb,
         )
         resp.raise_for_status()
         audio_bytes = resp.content

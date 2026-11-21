@@ -12,12 +12,15 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from bodhan_dub.gateway.bodhan import BodhanClient
+from bodhan_dub.gateway.cost import BudgetExceededError
 from bodhan_dub.gateway.llm import LLMClient
+from bodhan_dub.gateway.resilience import CircuitBreakerOpen
 from bodhan_dub.languages import LanguageRegistry
 from bodhan_dub.logging import PipelineLogger
 from bodhan_dub.media.audio_proc import time_stretch_audio
 from bodhan_dub.policy import guard_llm_output_english_only
 from bodhan_dub.stages.qa import QAMetrics, SpeechQA, SynthesisCandidate
+from bodhan_dub.stages.translate import check_dominant_script
 from bodhan_dub.stages.tts import CPSCalibrator, TTSSynthesizer
 from bodhan_dub.text.spans import verify_numbers_preserved
 
@@ -99,35 +102,22 @@ class SegmentFitController:
         target_char_budget: int,
         lang: str,
         segment_id: str,
+        terms_to_protect: Optional[List[str]] = None,
     ) -> Optional[str]:
         """
         Uses LLM to condense English source text within a character budget.
-        Validates English-only output and number preservation.
+        Validates English-only output, numbers, and proper names / glossary terms.
         """
         if not self.llm_client:
             return None
 
-        system_prompt = (
-            f"Condense the following English sentence into a concise version that can be spoken "
-            f"in fewer syllables, aiming for at most {target_char_budget} characters.\n"
-            f"Rules:\n"
-            f"1. Preserve the core meaning, all numerical values, dates, percentages, and proper names.\n"
-            f'2. Return ONLY valid JSON in format: {{"condensed_en": "<condensed English text>"}}\n'
-            f"3. Do not include any explanation or non-English text."
-        )
-        user_prompt = f'Original English: "{source_en}"'
-        fallback = CondensedEnglish(condensed_en="")
         try:
-            res: CondensedEnglish = await self.llm_client.query_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                schema=CondensedEnglish,
-                fallback_value=fallback,
-                stage="condense_fit",
+            condensed = await self.llm_client.condense_english(
+                source_en=source_en,
+                target_char_budget=target_char_budget,
                 lang=lang,
                 segment_id=segment_id,
             )
-            condensed = res.condensed_en.strip()
             if not condensed:
                 return None
 
@@ -144,7 +134,21 @@ class SegmentFitController:
                 )
                 return None
 
+            # Preserve glossary terms / proper names deterministically
+            if terms_to_protect:
+                for term in terms_to_protect:
+                    if term.lower() not in condensed.lower():
+                        self.logger.warning(
+                            f"Condensed English dropped term '{term}'; discarding condensation",
+                            stage="condense_fit",
+                            lang=lang,
+                            segment_id=segment_id,
+                        )
+                        return None
+
             return condensed
+        except (BudgetExceededError, CircuitBreakerOpen):
+            raise
         except Exception as e:
             self.logger.warning(
                 f"LLM condensation failed or was rejected: {e}",
@@ -159,6 +163,7 @@ class SegmentFitController:
         source_en: str,
         lang: str,
         segment_id: str,
+        terms_to_protect: Optional[List[str]] = None,
     ) -> Optional[str]:
         """
         Uses LLM to paraphrase English source text for cleaner translation and synthesis.
@@ -166,26 +171,12 @@ class SegmentFitController:
         if not self.llm_client:
             return None
 
-        system_prompt = (
-            "Paraphrase the following English sentence to be simpler, clearer, and easier to pronounce.\n"
-            "Rules:\n"
-            "1. Keep all numbers, names, and key factual details intact.\n"
-            '2. Return ONLY valid JSON in format: {{"paraphrased_en": "<paraphrased English text>"}}\n'
-            "3. Do not include any non-English text."
-        )
-        user_prompt = f'Original English: "{source_en}"'
-        fallback = ParaphrasedEnglish(paraphrased_en="")
         try:
-            res: ParaphrasedEnglish = await self.llm_client.query_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                schema=ParaphrasedEnglish,
-                fallback_value=fallback,
-                stage="paraphrase_qa",
+            paraphrased = await self.llm_client.paraphrase_english(
+                source_en=source_en,
                 lang=lang,
                 segment_id=segment_id,
             )
-            paraphrased = res.paraphrased_en.strip()
             if not paraphrased:
                 return None
 
@@ -194,7 +185,14 @@ class SegmentFitController:
             if not verify_numbers_preserved(source_en, paraphrased):
                 return None
 
+            if terms_to_protect:
+                for term in terms_to_protect:
+                    if term.lower() not in paraphrased.lower():
+                        return None
+
             return paraphrased
+        except (BudgetExceededError, CircuitBreakerOpen):
+            raise
         except Exception as e:
             self.logger.warning(
                 f"LLM paraphrase failed: {e}",
@@ -215,18 +213,57 @@ class SegmentFitController:
         lang: str,
         voice: str,
         code_mixed: bool = False,
+        terms_to_protect: Optional[List[str]] = None,
     ) -> Tuple[SegmentFitResult, Optional[np.ndarray]]:
         """
         Executes Diagram 3 Per-segment duration fit and QA loop.
         Returns (result_metadata, audio_48k_samples).
         """
         current_en = source_en
-        current_tr = initial_translation
+        current_tr = initial_translation.strip()
         target_code = lang
         if code_mixed and self.registry:
             info = self.registry.get_info(lang)
             if info and info.code_mixed_target:
                 target_code = info.code_mixed_target
+
+        # Check if initial translation is missing or purely Latin/English
+        is_script_valid = False
+        if current_tr:
+            if self.registry:
+                is_script_valid, _ = check_dominant_script(current_tr, lang, self.registry)
+            else:
+                is_script_valid = True
+
+        if not current_tr or not is_script_valid:
+            self.logger.warning(
+                f"Segment {segment_id} has invalid/empty translation ('{current_tr}'); skipping TTS to prevent sending English to Indic voice",
+                stage="fit",
+                lang=lang,
+                segment_id=segment_id,
+            )
+            result = SegmentFitResult(
+                segment_id=segment_id,
+                source_en=source_en,
+                final_en=current_en,
+                final_translation="",
+                raw_duration=0.0,
+                final_duration=0.0,
+                slot_duration=slot_duration,
+                start_shift=0.0,
+                speed_factor=1.0,
+                qa_metrics=QAMetrics(
+                    cer=1.0,
+                    passed=False,
+                    is_empty=True,
+                    failure_reasons=["translation_failed_or_non_indic"],
+                ),
+                qa_status="skipped",
+                fit_status="skipped",
+                attempts=0,
+                reasons=["translation_failed_or_non_indic"],
+            )
+            return result, None
 
         predicted_dur = self.calibrator.predict_duration(current_tr, lang, voice)
         pred_ratio = predicted_dur / max(0.1, slot_duration)
@@ -235,7 +272,7 @@ class SegmentFitController:
         if pred_ratio > 1.3:
             char_budget = max(15, int(len(source_en) * (slot_duration / predicted_dur) * 0.95))
             condensed = await self._condense_english_source(
-                source_en, char_budget, lang, segment_id
+                source_en, char_budget, lang, segment_id, terms_to_protect
             )
             if condensed and self.bodhan_client:
                 current_en = condensed
@@ -250,7 +287,10 @@ class SegmentFitController:
                         segment_id=segment_id,
                     )
                     if re_tr_text and re_tr_text.strip():
-                        current_tr = re_tr_text.strip()
+                        if not self.registry or check_dominant_script(re_tr_text, lang, self.registry)[0]:
+                            current_tr = re_tr_text.strip()
+                except (BudgetExceededError, CircuitBreakerOpen):
+                    raise
                 except Exception as e:
                     self.logger.warning(
                         f"Re-translation failed: {e}", stage="fit", lang=lang, segment_id=segment_id
@@ -260,21 +300,39 @@ class SegmentFitController:
         attempts = 0
         candidates: List[SynthesisCandidate] = []
         chosen_candidate: Optional[SynthesisCandidate] = None
+        current_max_chars = 180
+        last_nonce = None
 
         while attempts < 3:
             attempts += 1
             try:
                 if self.synthesizer:
-                    audio_48k, actual_dur, p_dur = await self.synthesizer.synthesize(
-                        text=current_tr,
-                        lang=lang,
-                        voice=voice,
-                        segment_id=f"{segment_id}_a{attempts}",
-                    )
+                    synth_kwargs = {}
+                    if last_nonce is not None:
+                        synth_kwargs["nonce"] = last_nonce
+                    if current_max_chars != 180:
+                        synth_kwargs["max_chars"] = current_max_chars
+                    try:
+                        audio_48k, actual_dur, p_dur = await self.synthesizer.synthesize(
+                            text=current_tr,
+                            lang=lang,
+                            voice=voice,
+                            segment_id=f"{segment_id}_a{attempts}",
+                            **synth_kwargs,
+                        )
+                    except TypeError:
+                        audio_48k, actual_dur, p_dur = await self.synthesizer.synthesize(
+                            text=current_tr,
+                            lang=lang,
+                            voice=voice,
+                            segment_id=f"{segment_id}_a{attempts}",
+                        )
                 else:
                     audio_48k = np.array([], dtype=np.float32)
                     actual_dur = 0.0
                     p_dur = predicted_dur
+            except (BudgetExceededError, CircuitBreakerOpen):
+                raise
             except Exception as e:
                 self.logger.error(
                     f"TTS synthesis exception on attempt {attempts}: {e}",
@@ -287,7 +345,7 @@ class SegmentFitController:
                 p_dur = predicted_dur
 
             # Evaluate QA
-            if self.speech_qa:
+            if self.speech_qa and len(audio_48k) > 0:
                 qa_metrics = await self.speech_qa.evaluate(
                     audio_48k=audio_48k,
                     reference_text=current_tr,
@@ -297,14 +355,15 @@ class SegmentFitController:
                 )
             else:
                 qa_metrics = QAMetrics(
-                    cer=0.0,
-                    passed=True,
+                    cer=0.0 if len(audio_48k) > 0 else 1.0,
+                    passed=(len(audio_48k) > 0),
                     has_repetition=False,
                     has_tail_omission=False,
                     duration_ratio=1.0,
                     is_silent=False,
                     is_clipped=False,
                     is_empty=len(audio_48k) == 0,
+                    failure_reasons=[] if len(audio_48k) > 0 else ["empty_audio"],
                 )
 
             cand = SynthesisCandidate(
@@ -321,14 +380,34 @@ class SegmentFitController:
                 break
 
             if attempts < 3:
-                # Plan retry action
-                action = (
-                    self.speech_qa.plan_retry_action(qa_metrics, attempts)
-                    if self.speech_qa
-                    else "retry_same"
+                previous_actions = [getattr(c, "action", "") for c in candidates if getattr(c, "action", None)]
+                if self.llm_client:
+                    action = await self.llm_client.plan_retry_action(
+                        failure_reasons=qa_metrics.failure_reasons,
+                        previous_actions=previous_actions,
+                        lang=lang,
+                        segment_id=segment_id,
+                    )
+                elif self.speech_qa:
+                    action = self.speech_qa.plan_retry_action(qa_metrics, attempts)
+                else:
+                    action = "retry_same"
+                cand.action = action
+                self.logger.info(
+                    f"QA failed on attempt {attempts} (reasons: {qa_metrics.failure_reasons}); planning action: {action}",
+                    stage="qa",
+                    lang=lang,
+                    segment_id=segment_id,
                 )
-                if action == "paraphrase_source":
-                    paraphrased = await self._paraphrase_english_source(source_en, lang, segment_id)
+
+                if action == "split_text":
+                    # Re-split at a smaller safe length (half previous max_chars)
+                    current_max_chars = max(30, current_max_chars // 2)
+                    last_nonce = attempts + 1
+                elif action == "paraphrase_source":
+                    paraphrased = await self._paraphrase_english_source(
+                        source_en, lang, segment_id, terms_to_protect
+                    )
                     if paraphrased and self.bodhan_client:
                         current_en = paraphrased
                         try:
@@ -341,7 +420,10 @@ class SegmentFitController:
                                 segment_id=segment_id,
                             )
                             if tr_text and tr_text.strip():
-                                current_tr = tr_text.strip()
+                                if not self.registry or check_dominant_script(tr_text, lang, self.registry)[0]:
+                                    current_tr = tr_text.strip()
+                        except (BudgetExceededError, CircuitBreakerOpen):
+                            raise
                         except Exception as e:
                             self.logger.warning(
                                 f"Re-translation failed: {e}",
@@ -349,10 +431,11 @@ class SegmentFitController:
                                 lang=lang,
                                 segment_id=segment_id,
                             )
+                    last_nonce = None
                 elif action == "condense":
                     budget = max(15, int(len(current_en) * 0.8))
                     condensed = await self._condense_english_source(
-                        current_en, budget, lang, segment_id
+                        current_en, budget, lang, segment_id, terms_to_protect
                     )
                     if condensed and self.bodhan_client:
                         current_en = condensed
@@ -366,7 +449,10 @@ class SegmentFitController:
                                 segment_id=segment_id,
                             )
                             if tr_text and tr_text.strip():
-                                current_tr = tr_text.strip()
+                                if not self.registry or check_dominant_script(tr_text, lang, self.registry)[0]:
+                                    current_tr = tr_text.strip()
+                        except (BudgetExceededError, CircuitBreakerOpen):
+                            raise
                         except Exception as e:
                             self.logger.warning(
                                 f"Re-translation failed: {e}",
@@ -374,10 +460,25 @@ class SegmentFitController:
                                 lang=lang,
                                 segment_id=segment_id,
                             )
+                    last_nonce = None
+                else:  # retry_same
+                    last_nonce = attempts + 1
 
         # 3. Decision on candidate Usability (Diagram 3: O2)
         qa_status = "passed"
         if chosen_candidate is None:
+            # Sort remaining candidates by lowest CER (best candidate by CER is kept)
+            valid_cands = [c for c in candidates if len(c.audio_48k) > 0 and not c.metrics.is_empty]
+            if valid_cands:
+                valid_cands.sort(key=lambda c: c.metrics.cer)
+                best = valid_cands[0]
+                if best.metrics.cer < 0.45 and not best.metrics.is_silent:
+                    chosen_candidate = best
+                    qa_status = "degraded"
+                else:
+                    qa_status = "skipped"
+            else:
+                qa_status = "skipped"
             # Sort remaining candidates by lowest CER
             valid_cands = [c for c in candidates if len(c.audio_48k) > 0 and not c.metrics.is_empty]
             if valid_cands:

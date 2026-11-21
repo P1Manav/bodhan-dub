@@ -79,3 +79,87 @@ def test_write_transcript_and_subtitles(tmp_path):
     assert len(data) == 1
     assert data[0]["id"] == "seg_0001"
     assert data[0]["slot"] == [1.0, 4.5]
+
+
+def test_target_subtitles_omits_skipped_and_matches_placed_count(tmp_path):
+    """B6: Subtitles use placed times and omit skipped/failed slots."""
+    from bodhan_dub.stages.subtitles import write_target_segments_json, write_target_subtitles
+
+    segments_data = [
+        {
+            "segment_id": "seg_01",
+            "source_text": "Hello world.",
+            "target_text": "नमस्ते दुनिया।",
+            "status": "ok",
+            "cer": 0.02,
+            "duration_raw": 1.5,
+            "duration_placed": 1.5,
+            "speed_factor": 1.0,
+            "offset_applied_ms": 10.0,
+            "qa_verdict": "passed",
+            "retry_count": 0,
+            "cost_inr": 0.005,
+            "start": 1.01,
+            "end": 2.51,
+        },
+        {
+            "segment_id": "seg_02",
+            "source_text": "Failed text.",
+            "target_text": "",
+            "status": "skipped",
+            "cer": 1.0,
+            "duration_raw": 0.0,
+            "duration_placed": 0.0,
+            "speed_factor": 1.0,
+            "offset_applied_ms": 0.0,
+            "qa_verdict": "skipped",
+            "retry_count": 0,
+            "cost_inr": 0.0,
+            "start": 3.0,
+            "end": 4.0,
+        },
+        {
+            "segment_id": "seg_03",
+            "source_text": "Third sentence.",
+            "target_text": "तीसरा वाक्य।",
+            "status": "ok",
+            "cer": 0.01,
+            "duration_raw": 1.2,
+            "duration_placed": 1.2,
+            "speed_factor": 1.0,
+            "offset_applied_ms": 0.0,
+            "qa_verdict": "passed",
+            "retry_count": 0,
+            "cost_inr": 0.004,
+            "start": 4.5,
+            "end": 5.7,
+        },
+    ]
+
+    srt_path = tmp_path / "subtitles.hi.srt"
+    vtt_path = tmp_path / "subtitles.hi.vtt"
+    write_target_subtitles(segments_data, srt_path, vtt_path)
+
+    srt_text = srt_path.read_text(encoding="utf-8")
+    vtt_text = vtt_path.read_text(encoding="utf-8")
+
+    # Exactly 2 cues emitted (1 and 2), skipped slot omitted!
+    assert "1\n00:00:01,010 --> 00:00:02,510\nनमस्ते दुनिया।" in srt_text
+    assert "2\n00:00:04,500 --> 00:00:05,700\nतीसरा वाक्य।" in srt_text
+    assert "Failed text" not in srt_text
+    assert "WEBVTT" in vtt_text
+    assert "नमस्ते दुनिया।" in vtt_text
+
+    # Verify segments.json schema
+    seg_json_path = tmp_path / "segments.hi.json"
+    write_target_segments_json(segments_data, seg_json_path)
+    import json
+    loaded = json.loads(seg_json_path.read_text(encoding="utf-8"))
+    assert len(loaded) == 3
+    required_keys = {
+        "source_text", "target_text", "status", "cer", "duration_raw",
+        "duration_placed", "speed_factor", "offset_applied_ms",
+        "qa_verdict", "retry_count", "cost_inr"
+    }
+    for item in loaded:
+        assert required_keys.issubset(item.keys())

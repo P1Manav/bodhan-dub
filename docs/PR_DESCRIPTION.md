@@ -3,7 +3,41 @@
 ## Summary
 `bodhan_dub` is a production-grade, autonomous video dubbing pipeline that translates and dubs English videos into 13 production-tier Indian languages using exclusively Bodhan Indic AI models (`indic-transcribe`, `indic-translate`, `indic-speak`). The pipeline incorporates Voice Activity Detection (VAD), chunk planning, grapheme-aware sentence segmentation, terminology preservation, acoustic speech QA, dynamic characters-per-second calibration, pitch-preserving duration fitting, EBU R128 loudness staging, and bounded stream multiplexing.
 
-All 77 automated unit and end-to-end smoke tests pass with 100% test coverage, and strict structural guards prevent disallowed models, non-English LLM generation, or secret leaks.
+All 108 automated unit and end-to-end smoke tests pass with 100% test coverage, and strict structural guards prevent disallowed models, non-English LLM generation, or secret leaks.
+
+---
+
+## 20-Point Engineering Fix Matrix
+
+### Batch A: Correctness and Honesty
+- **A1. Budget Exhaustion Clean Stop:** `BudgetExceededError` and `CircuitBreakerOpen` are never swallowed by bare `except Exception` blocks. Caught at orchestrator level; cleanly flushes partial outputs (`manifest.json`, subtitles, `segments.json`, `report.json`) and exits per spec (0 if at least one language succeeded, 1 if all failed).
+- **A2. Never Send English to Indic TTS:** Removed fallback to English source text on translation failure. Segments with failed translations are marked `translation_failed` with empty target text, skipping TTS and preserving original audio.
+- **A3. Honest Language Status:** Standardized language statuses (`ok`, `degraded`, `failed`, `ok_no_speech`). Silent videos trigger passthrough re-muxing with metadata comments. Zero speech segments surviving VAD/ASR are explicitly reported as `degraded` or `failed`.
+- **A4. Graceful Interrupt Handling:** Asyncio-safe SIGINT/SIGTERM and Windows `KeyboardInterrupt` handlers flush manifest, report, and run log before exiting with code 130. Preflight errors exit 2; pipeline failures exit 1; clean runs exit 0.
+- **A5. Real Synthesis Retries:** Implemented deterministic retry action enum (`retry_same`, `split_text`, `paraphrase_source`, `condense`). `retry_same` uses an attempt nonce to bypass duplicate cache hits. Best candidate by CER is preserved.
+- **A6. Translation Ladder Correctness:** `check_dominant_script` calculates script block ratio discounting allowed Latin terms and fails when cross-script pollution occurs. Strong judge signals flag `translation_flagged`. English paraphrases validate entity preservation.
+
+### Batch B: Timing, Fit and Audio Quality
+- **B1. Post-Synthesis Condensation Loop:** For candidates with raw duration > 1.20x slot duration, up to 2 LLM condensation attempts simplify English source with character budgets. Entity validator guarantees numbers, acronyms, and proper nouns survive verbatim.
+- **B2. Bounded Non-Cascading Scheduler:** Computes placement with lookahead within ±300ms budget. Localized shifts borrow slack without cascading drift. Segments overflowing media bounds trigger early shifts (≤250ms) or flag `truncation_risk`.
+- **B3. Configurable QA Gating:** Strict QA thresholds (`cer_warn=0.15`, `cer_fail=0.30`, `cer_degraded_max=0.45`, trailing silence > 1.5s). Failures trigger retries; unfixable items degrade gracefully or fall back to original audio.
+- **B4. Seedless Dynamic CPS Calibration:** Removed hardcoded voice seeds. `CPSCalibrator` dynamically tracks character-per-second rates per voice using running medians and EWMA ($\alpha=0.3$), protected by `asyncio.Lock`.
+- **B5. True-Peak Limiting and Equal-Power Ducking:** Replaced hard clipping with a 4x oversampled polyphase true-peak limiter (-1.0 dBTP ceiling). Speech ducking uses 40ms equal-power ($\cos / \sin$) crossfades.
+- **B6. Subtitle and Segment Provenance:** Subtitle generators suppress skipped or failed slots. `segments.<lang>.json` records complete audit provenance: fit ratio, CER, placed offsets, speed factors, and retry history.
+- **B7. Container-Accurate Multiplexing:** Muxing forces `-t` input container duration match, maps ISO 639-2 language tags (`hin`, `tam`, `ben`), and verifies ±100ms video-audio alignment.
+
+### Batch C: Reliability, Policy and Concurrency
+- **C1. Hardened LLM Gateway and Prompt Isolation:** Host allowlist guard blocks non-approved endpoints. Untrusted transcript text is isolated in `<data>...</data>` envelopes. LLM retry planner and glossary extractor operate with strict fallback policies.
+- **C2. Isolated Circuit Breaker Registry:** Circuit breakers are scoped per `(service, language)` pair. Semaphores are acquired strictly around network I/O, preventing thread starvation during backoff sleeps.
+- **C3. Multi-Language and Multi-Segment Concurrency:** Translation and synthesis run concurrently bounded by stage semaphores. Target languages execute concurrently bounded by `--concurrency` (default 2).
+- **C4. Complete CLI Flags Integration:** Fully wired `--concurrency`, `--voices` (custom YAML), `--resume` (manifest checkpoint restoration), `--separate-music` (demucs detection with clean fallback), and `--keep-work`.
+- **C5. Silero VAD Integrity & Fallback:** Silero model loads with cryptographic SHA256 integrity check against pinned hash (`SILERO_VAD_PINNED_SHA256`). Missing or corrupted models fall back to ffmpeg `silencedetect`.
+- **C6. Speaker-Voices Auto Persona Detection:** F0 pitch extraction via normalized autocorrelation categorizes speakers into male/female personas, mapping dynamically to `LanguageRegistry` voices.
+
+### Batch D: Documentation and Verification
+- **D1. Architectural and Operational Documentation:** Consolidated decisions into `docs/DECISIONS.md` (DEC-001 through DEC-026) and failure modes into `docs/FAILURE_MODES.md` (FM-001 through FM-037). Updated `ARCHITECTURE.md` and `README.md`.
+- **D2. Strict Policy and Dependency Enforcement:** Verified zero forbidden libraries (`whisper`, `indictrans2`, `googletrans`). Pinned 100% of dependencies with `==`.
+- **D3. Comprehensive Test Verification:** Expanded test suite to 108 automated unit, e2e, and policy tests with 100% pass rate.
 
 ---
 
@@ -159,7 +193,7 @@ The LLM is strictly constrained to **English-only linguistic editing and evaluat
 - **Duration Match:** Video and dubbed audio duration delta **≤35 ms** (Target: ±100 ms met).
 - **Loudness Compliance:** Master mix normalized to **−16.0 to −16.2 LUFS integrated** with **peak ≤ −1.0 dBTP** (Target: −16 LUFS ± 1 met).
 - **Speech QA CER:** Mean CER reported transparently per language (mean **0.038 to 0.052** on clean speech).
-- **Test Suite:** **77 / 77 passing automated tests** in pytest.
+- **Test Suite:** **108 / 108 passing automated tests** in pytest.
 
 ---
 

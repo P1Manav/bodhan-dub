@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import signal
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import httpx
 
@@ -86,8 +85,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=4,
-        help="Maximum concurrent parallel language workers",
+        default=2,
+        help="Maximum concurrent parallel language workers (default: 2)",
     )
     parser.add_argument(
         "--no-cache",
@@ -200,6 +199,21 @@ async def async_main(
         )
         return 2
 
+    # Parse optional custom voices mapping
+    custom_voices: Dict[str, str] = {}
+    if args.voices:
+        v_path = Path(args.voices)
+        if v_path.exists():
+            import yaml
+            try:
+                content = yaml.safe_load(v_path.read_text(encoding="utf-8"))
+                if isinstance(content, dict):
+                    custom_voices = {str(k).strip(): str(v).strip() for k, v in content.items()}
+            except Exception as e:
+                logger.warning(f"Failed to parse custom voices file '{v_path}': {e}", stage="cli")
+        else:
+            logger.warning(f"Custom voices file '{v_path}' not found", stage="cli")
+
     # Manifest initialization for resume tracking
     manifest_path = out_dir / "manifest.json"
     manifest = RunManifest.load(manifest_path) if args.resume else None
@@ -225,6 +239,11 @@ async def async_main(
         glossary_path=args.glossary,
         code_mixed=args.code_mixed,
         keep_work=args.keep_work,
+        concurrency=args.concurrency,
+        resume=args.resume,
+        separate_music=args.separate_music,
+        speaker_voices=args.speaker_voices,
+        custom_voices=custom_voices,
     )
 
     try:
@@ -232,8 +251,20 @@ async def async_main(
             video_path=args.input,
             target_langs=target_langs,
             max_cost_inr=args.max_cost_inr,
+            custom_voices=custom_voices,
         )
         return exit_code
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.warning(
+            "Pipeline interrupted by user (SIGINT/KeyboardInterrupt). Flushing partial outputs.",
+            stage="cli",
+        )
+        orchestrator.flush_partial_state(args.input)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected pipeline exception: {e}", stage="cli")
+        orchestrator.flush_partial_state(args.input)
+        raise
     finally:
         await orchestrator.close()
 
@@ -243,20 +274,17 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Handle Ctrl-C gracefully with exit code 130 per spec
-    def sigint_handler(signum, frame):
-        print(
-            "\n[INFO] Interrupted by user (SIGINT). Writing partial manifest and exiting...",
-            file=sys.stderr,
-        )
-        sys.exit(130)
-
-    signal.signal(signal.SIGINT, sigint_handler)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     try:
-        exit_code = asyncio.run(async_main(args))
+        exit_code = loop.run_until_complete(async_main(args))
         sys.exit(exit_code)
     except KeyboardInterrupt:
+        print(
+            "\n[INFO] Interrupted by user (SIGINT). Flushed partial manifest and report.",
+            file=sys.stderr,
+        )
         sys.exit(130)
     except PreflightError as e:
         print(f"\n[ERROR] {e}", file=sys.stderr)
@@ -264,6 +292,8 @@ def main() -> None:
     except Exception as e:
         print(f"\n[FATAL] Unexpected error: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":

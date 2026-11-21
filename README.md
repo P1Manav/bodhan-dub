@@ -63,7 +63,7 @@ The system strictly adheres to the five architectural workflows specified in `do
 │   ├── media/                 # VAD, audio extraction, loudness, mixer, muxer
 │   ├── stages/                # ASR, translation, glossary, TTS, fit, QA, scheduler, subtitles, report
 │   └── text/                  # Unicode grapheme clusters, CER, spans, normalization
-└── tests/                     # 80 unit, e2e smoke, and mock tests (100% pass)
+└── tests/                     # 108 automated unit, e2e smoke, resilience, and policy tests (100% pass)
 ```
 
 ---
@@ -141,7 +141,7 @@ python -m bodhan_dub --input path/to/video.mp4 --langs hi,ta,bn --estimate-only
 | `--code-mixed` | Flag | `False` | Retain English technical vocabulary in Indic translation |
 | `--max-cost-inr` | Float | `None` | Budget limit in INR; pipeline stops cleanly if reached |
 | `--estimate-only` | Flag | `False` | Print cost estimate table in INR and exit |
-| `--concurrency` | Int | `4` | Maximum parallel language worker concurrency |
+| `--concurrency` | Int | `2` | Maximum parallel language worker concurrency |
 | `--no-cache` | Flag | `False` | Disable content-addressed sha256 disk cache |
 | `--resume` | Flag | `False` | Resume execution from existing run checkpoints |
 | `--keep-work` | Flag | `False` | Retain intermediate extracted audio and stems |
@@ -189,7 +189,7 @@ out/
 ## Running Tests and Linting
 
 ```bash
-# Run all 80 unit, e2e smoke, and mock tests
+# Run all 108 automated unit, e2e smoke, resilience, and policy tests
 pytest tests/ -v
 
 # Run linter

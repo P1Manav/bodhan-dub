@@ -222,3 +222,137 @@ async def test_fit_controller_condensation_and_paraphrase(
         await b_client.close()
         await llm_client.close()
 
+
+@pytest.mark.asyncio
+async def test_fit_controller_keeps_best_candidate_by_cer(test_logger):
+    """
+    Assert that when all attempts fail strict QA, the candidate with lowest CER (<0.45)
+    is kept with degraded status.
+    """
+    class MultiAttemptTTS:
+        def __init__(self):
+            self.calls = 0
+
+        async def synthesize(self, text, lang, voice, segment_id, nonce=None, max_chars=180):
+            self.calls += 1
+            audio = np.full(48000, 0.2, dtype=np.float32)
+            return audio, 1.0, 1.0
+
+    class MultiAttemptQA:
+        def __init__(self):
+            self.attempt = 0
+            # Attempt 1: CER 0.40, Attempt 2: CER 0.22 (best), Attempt 3: CER 0.35
+            self.cers = [0.40, 0.22, 0.35]
+
+        async def evaluate(self, audio_48k, reference_text, predicted_duration, lang, segment_id):
+            cer = self.cers[min(self.attempt, len(self.cers) - 1)]
+            self.attempt += 1
+            return QAMetrics(
+                cer=cer,
+                passed=False,  # strict pass failed
+                has_repetition=False,
+                has_tail_omission=False,
+                duration_ratio=1.0,
+                is_silent=False,
+                is_clipped=False,
+                is_empty=False,
+                failure_reasons=[f"cer_high_{cer:.2f}"],
+            )
+
+        def plan_retry_action(self, metrics, attempt):
+            return "retry_same"
+
+    tts = MultiAttemptTTS()
+    qa = MultiAttemptQA()
+
+    controller = SegmentFitController(
+        bodhan_client=None,
+        llm_client=None,
+        logger=test_logger,
+        tts_synthesizer=tts,
+        speech_qa=qa,
+    )
+
+    res, audio = await controller.process_segment(
+        segment_id="seg_best_cer",
+        source_en="Hello world",
+        initial_translation="नमस्ते दुनिया",
+        slot_duration=1.0,
+        slack_before=0.1,
+        slack_after=0.1,
+        lang="hi",
+        voice="Kavya",
+    )
+
+    assert res.qa_status == "degraded"
+    assert res.qa_metrics.cer == 0.22  # Lowest CER candidate kept!
+    assert audio is not None
+    assert res.attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_fit_retry_split_text_on_tail_omission(test_logger):
+    """
+    Assert that tail-omission triggers split_text action and retry text/params differ.
+    """
+    received_max_chars = []
+
+    class MockTTS:
+        async def synthesize(self, text, lang, voice, segment_id, nonce=None, max_chars=180):
+            received_max_chars.append(max_chars)
+            audio = np.full(48000, 0.2, dtype=np.float32)
+            return audio, 1.0, 1.0
+
+    class TailOmissionQA:
+        def __init__(self):
+            self.attempt = 0
+
+        async def evaluate(self, audio_48k, reference_text, predicted_duration, lang, segment_id):
+            self.attempt += 1
+            if self.attempt == 1:
+                return QAMetrics(
+                    cer=0.15,
+                    passed=False,
+                    has_tail_omission=True,
+                    failure_reasons=["tail_omission"],
+                )
+            return QAMetrics(
+                cer=0.02,
+                passed=True,
+                has_tail_omission=False,
+            )
+
+        def plan_retry_action(self, metrics, attempt):
+            if metrics.has_tail_omission:
+                return "split_text"
+            return "retry_same"
+
+    tts = MockTTS()
+    qa = TailOmissionQA()
+
+    controller = SegmentFitController(
+        bodhan_client=None,
+        llm_client=None,
+        logger=test_logger,
+        tts_synthesizer=tts,
+        speech_qa=qa,
+    )
+
+    res, audio = await controller.process_segment(
+        segment_id="seg_tail_omission",
+        source_en="Long sentence with tail omitted.",
+        initial_translation="लंबा वाक्य जिसका अंत कट गया।",
+        slot_duration=1.0,
+        slack_before=0.1,
+        slack_after=0.1,
+        lang="hi",
+        voice="Kavya",
+    )
+
+    assert res.qa_status == "passed"
+    assert res.attempts == 2
+    # Attempt 1 used 180 max_chars, attempt 2 used 90 max_chars (split_text safe length)
+    assert len(received_max_chars) == 2
+    assert received_max_chars[0] == 180
+    assert received_max_chars[1] == 90
+

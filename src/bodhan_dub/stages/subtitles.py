@@ -95,8 +95,9 @@ def write_target_subtitles(
     segments_data: list,
     srt_path: Path,
     vtt_path: Path,
+    omit_skipped: bool = True,
 ) -> None:
-    """Writes both SRT and VTT subtitle files for target language."""
+    """Writes both SRT and VTT subtitle files for target language using placed timestamps."""
     srt_path = Path(srt_path)
     vtt_path = Path(vtt_path)
     srt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,26 +106,39 @@ def write_target_subtitles(
     srt_lines: List[str] = []
     vtt_lines: List[str] = ["WEBVTT", ""]
 
-    for i, seg in enumerate(segments_data, 1):
+    cue_idx = 0
+    for seg in segments_data:
+        # B6: Do not emit Indic subtitle cues for skipped or translation_failed slots
+        status = seg.get("status", "")
+        fit_status = seg.get("fit_status", "")
+        qa_status = seg.get("qa_status", "")
+        if omit_skipped and (
+            status in ("skipped", "translation_failed")
+            or fit_status == "skipped"
+            or qa_status == "skipped"
+        ):
+            continue
+
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", 0.0))
-        text = str(seg.get("translated_text", "")).strip()
+        text = str(seg.get("target_text") or seg.get("translated_text", "")).strip()
 
         if not text or end <= start:
             continue
 
+        cue_idx += 1
         wrapped = wrap_text_graphemes(text, max_line_chars=40, max_lines=2)
 
         start_srt = format_srt_timestamp(start)
         end_srt = format_srt_timestamp(end)
-        srt_lines.append(f"{i}")
+        srt_lines.append(f"{cue_idx}")
         srt_lines.append(f"{start_srt} --> {end_srt}")
         srt_lines.append(wrapped)
         srt_lines.append("")
 
         start_vtt = format_vtt_timestamp(start)
         end_vtt = format_vtt_timestamp(end)
-        vtt_lines.append(f"{i}")
+        vtt_lines.append(f"{cue_idx}")
         vtt_lines.append(f"{start_vtt} --> {end_vtt}")
         vtt_lines.append(wrapped)
         vtt_lines.append("")

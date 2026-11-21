@@ -34,7 +34,7 @@ dev = [
     "ruff==0.17.2",
 ]
 music = [
-    "demucs>=4.0.0",
+    "demucs==4.0.1",
 ]
 
 [tool.setuptools.packages.find]

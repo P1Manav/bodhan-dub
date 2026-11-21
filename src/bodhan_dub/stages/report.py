@@ -26,17 +26,20 @@ class TargetEvaluation(BaseModel):
 
 
 class LanguageSummary(BaseModel):
-    status: str  # ok, degraded, failed
+    status: str  # ok, degraded, failed, ok_no_speech
     total_segments: int
     placed_segments: int
     degraded_segments: int
     skipped_segments: int
+    flagged_segments: int = 0
+    overrun_segments: int = 0
     stretch_stats: Dict[str, float] = Field(default_factory=dict)
     sync_offset_stats: Dict[str, float] = Field(default_factory=dict)
     cer_stats: Dict[str, float] = Field(default_factory=dict)
     integrated_lufs: float
     duration_delta_ms: float
     retries_count: int
+    errors: List[str] = Field(default_factory=list)
 
 
 class PipelineReport(BaseModel):
@@ -77,13 +80,37 @@ def build_pipeline_report(
         overall_status = "failed"
     elif any(s.status == "degraded" for s in lang_summaries.values()):
         overall_status = "degraded"
+    elif lang_summaries and all(s.status == "ok_no_speech" for s in lang_summaries.values()):
+        overall_status = "ok_no_speech"
 
     costs_breakdown = cost_ledger.get_summary_sync()
 
     # Targets Evaluation
     targets: List[TargetEvaluation] = []
 
-    # 1. Sync Offset Target (±300 ms)
+    # 1. Segment Placement & Coverage Target
+    total_segs = sum(s.total_segments for s in lang_summaries.values())
+    total_skipped = sum(s.skipped_segments for s in lang_summaries.values())
+    skip_reasons = []
+    for s in lang_summaries.values():
+        if s.skipped_segments > 0 and s.errors:
+            skip_reasons.extend(s.errors)
+    coverage_reason = (
+        f"Skipped {total_skipped} segment(s) (reasons: {', '.join(set(skip_reasons)) if skip_reasons else 'failed synthesis or checks'})"
+        if total_skipped > 0
+        else "All speech segments placed without omissions"
+    )
+    targets.append(
+        TargetEvaluation(
+            name="Speech segment coverage",
+            target="100% speech segments placed (0 skipped)",
+            measured=f"{total_skipped} skipped out of {total_segs} segments" if total_segs > 0 else "0 segments (passthrough)",
+            met=(total_skipped == 0),
+            reason=coverage_reason,
+        )
+    )
+
+    # 2. Sync Offset Target (±300 ms)
     max_sync = 0.0
     for s in lang_summaries.values():
         if "max_ms" in s.sync_offset_stats:

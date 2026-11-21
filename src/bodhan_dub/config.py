@@ -22,6 +22,11 @@ def _find_env_file() -> str:
     return ".env"
 
 
+SILERO_VAD_PINNED_SHA256 = (
+    "2ea52a1c618ec50428f5370d0b8b1a8d0f1b2123d47d953a99e71e74a80fb4ff"
+)
+
+
 class Settings(BaseSettings):
     """Core pipeline configuration and secrets."""
 
@@ -91,6 +96,11 @@ class Settings(BaseSettings):
 
     # Circuit Breaker: consecutive 5xx failures to trigger fast fail for a language
     circuit_breaker_threshold: int = 5
+
+    # QA Thresholds (CER and degraded cutoff)
+    cer_warn: float = 0.15
+    cer_fail: float = 0.30
+    cer_degraded_max: float = 0.45
 
     def redact_key(self, key_str: str) -> str:
         """Helper to redact sensitive credentials for safe logging."""

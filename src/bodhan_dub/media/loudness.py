@@ -9,6 +9,7 @@ from typing import Tuple
 
 import numpy as np
 import pyloudnorm as pyln
+import scipy.signal
 
 
 def measure_loudness(audio_48k: np.ndarray, sample_rate: int = 48000) -> float:
@@ -36,17 +37,54 @@ def measure_loudness(audio_48k: np.ndarray, sample_rate: int = 48000) -> float:
         return -70.0
 
 
+def measure_true_peak_dbtp(audio: np.ndarray) -> float:
+    """Measures maximum true peak in dBTP using 4x polyphase oversampling."""
+    if len(audio) == 0:
+        return -100.0
+    if audio.ndim == 1:
+        oversampled = scipy.signal.resample_poly(audio, up=4, down=1)
+        peak_linear = np.max(np.abs(oversampled))
+    else:
+        peak_linear = max(
+            np.max(np.abs(scipy.signal.resample_poly(audio[:, ch], up=4, down=1)))
+            for ch in range(audio.shape[1])
+        )
+    if peak_linear <= 1e-9:
+        return -100.0
+    return float(20.0 * np.log10(peak_linear))
+
+
 def apply_peak_limiter(audio: np.ndarray, max_peak_dbtp: float = -1.0) -> np.ndarray:
     """
-    Limits true peaks to max_peak_dbtp (default -1.0 dBTP = ~0.8912 max amplitude).
+    Limits true peaks to max_peak_dbtp (default -1.0 dBTP = ~0.89125 linear amplitude)
+    using 4x polyphase oversampling via scipy.signal.resample_poly.
     """
+    if len(audio) == 0:
+        return audio
     ceiling = 10.0 ** (max_peak_dbtp / 20.0)
-    current_peak = np.max(np.abs(audio))
 
-    if current_peak > ceiling and current_peak > 0:
-        scale = ceiling / current_peak
-        return audio * scale
-    return audio
+    # Fast 1x peak check
+    max_1x = np.max(np.abs(audio))
+    if max_1x <= 0:
+        return audio
+
+    # 4x oversampled true peak
+    if audio.ndim == 1:
+        oversampled = scipy.signal.resample_poly(audio, up=4, down=1)
+        peak_tp = np.max(np.abs(oversampled))
+    else:
+        peak_tp = max(
+            np.max(np.abs(scipy.signal.resample_poly(audio[:, ch], up=4, down=1)))
+            for ch in range(audio.shape[1])
+        )
+
+    if peak_tp > ceiling and peak_tp > 0:
+        scale = ceiling / peak_tp
+        return (audio * scale).astype(np.float32)
+    return audio.astype(np.float32)
+
+
+apply_true_peak_limiter = apply_peak_limiter
 
 
 def normalize_to_target_lufs(

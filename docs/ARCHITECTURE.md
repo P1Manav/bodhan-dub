@@ -237,3 +237,30 @@ sequenceDiagram
     O->>O: commit segment to timeline
   end
 ```
+
+---
+
+## 6. Architectural Invariants and Resilience Guarantees
+
+1. **Per-(Service, Language) Fault Isolation:**
+   - Circuit breakers are partitioned as `(service, language)` tuples in `CircuitBreakerRegistry`.
+   - A degradation or failure in one language's TTS (e.g. `("speak", "ta")`) trips open only that isolated circuit breaker; concurrent operations in Hindi (`("speak", "hi")`) or shared ASR (`("transcribe", "en")`) remain unimpeded.
+   - Semaphore acquisition is strictly scoped around network I/O and released prior to exponential backoff sleeps to eliminate connection pool starvation.
+
+2. **Strict LLM Boundary and Adversarial Prompt Containment:**
+   - The LLM strictly processes and produces English text.
+   - Transcript inputs passed to the LLM are encapsulated in `<data>...</data>` envelopes to prevent prompt injection from untrusted transcript text.
+   - A Unicode character-range policy guard rejects any LLM response containing non-English / non-Latin characters (Devanagari, Bengali, Tamil, Arabic, etc.).
+   - Paraphrasing and condensation enforce strict preservation of numbers, proper names, and glossary terms.
+
+3. **Timeline Drift Prevention and Zero Audio Truncation:**
+   - Timeline scheduling computes segment placement using forward-looking gap evaluation within a strict ±300ms synchronization budget.
+   - Any localized delay or stretch does not cascade onto downstream segments; later segments start at their own source timestamps unless unavoidable overlap occurs.
+   - Speech is never silently clipped; media-boundary overruns trigger early shifts or `truncation_risk` warnings while preserving speech content.
+
+4. **Dynamic Speech Rate Calibration:**
+   - Characters-per-second (CPS) estimation is initialized seedlessly at 12.0 chars/sec and dynamically updated per voice via Exponential Weighted Moving Average (EWMA, $\alpha=0.3$) and running medians, guarded by `asyncio.Lock` for thread-safe concurrent synthesis.
+
+5. **Honest Multi-Language Status and Exit Semantics:**
+   - Status reporting explicitly differentiates `ok`, `ok_no_speech`, `degraded`, and `failed`.
+   - Budget exhaustion (`BudgetExceededError`) or circuit trips immediately cease work, flush partial artifacts (`segments.json`, subtitles, `report.json`), and exit cleanly with spec-compliant codes (exit code 0 if at least one language succeeded, exit code 1 if all languages failed).
