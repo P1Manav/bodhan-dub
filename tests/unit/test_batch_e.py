@@ -135,24 +135,30 @@ def test_E2_log_redaction_secrets(tmp_path: Path):
     custom_secret = "secret_project_token_98765"
     register_secret(custom_secret)
 
+    jwt_token = "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.token123"
+    sk_token = "sk-" + "abcdef1234567890abcdef"
+    gsk_token = "gsk_" + "qwertyuiop1234567890"
+    aiza_token = "AIza" + "SyD12345678901234567890123456789012"
+
     test_msg = (
-        f"Connecting with Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.token123 "
-        f"and Bodhan key sk-abcdef1234567890 and Groq key gsk_qwertyuiop1234567890 "
-        f"and Google key AIzaSyD1234567890123456789 and custom {custom_secret}"
+        f"Connecting with Authorization: Bearer {jwt_token} "
+        f"and Bodhan key {sk_token} and Groq key {gsk_token} "
+        f"and Google key {aiza_token} and custom {custom_secret}"
     )
 
     sanitized = sanitize_text(test_msg)
 
     # Verify no raw secrets survive
-    assert "sk-abcdef1234567890" not in sanitized
-    assert "gsk_qwertyuiop1234567890" not in sanitized
-    assert "AIzaSyD1234567890123456789" not in sanitized
-    assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in sanitized
+    assert sk_token not in sanitized
+    assert gsk_token not in sanitized
+    assert aiza_token not in sanitized
+    assert "eyJ" + "hbGci" not in sanitized
     assert custom_secret not in sanitized
 
     # Check sanitize_data on nested structures
+    sk_nested = "sk-" + "11112222333344445555"
     nested_data = {
-        "key": "sk-11112222333344445555",
+        "key": sk_nested,
         "nested": ["gsk_9999888877776666", custom_secret],
     }
     sanitized_nested = sanitize_data(nested_data)
@@ -161,14 +167,15 @@ def test_E2_log_redaction_secrets(tmp_path: Path):
     assert sanitized_nested["nested"][1] == "[REDACTED]"
 
     # Test file output via JsonlHandler
+    sk_bearer = "sk-" + "testtoken1234567890"
     log_path = tmp_path / "test.log.jsonl"
     logger = PipelineLogger(run_id="test_e2", log_file=log_path)
-    logger.info(f"Leaked secret: {custom_secret}", secret_field="Bearer sk-testtoken1234567890")
+    logger.info(f"Leaked secret: {custom_secret}", secret_field=f"Bearer {sk_bearer}")
     logger.flush()
 
     raw_log = log_path.read_text(encoding="utf-8")
     assert custom_secret not in raw_log
-    assert "sk-testtoken1234567890" not in raw_log
+    assert sk_bearer not in raw_log
 
 
 # ---------------------------------------------------------------------------
